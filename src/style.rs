@@ -19,6 +19,8 @@ pub const FONT: &[u8] = include_bytes!("../assets/fonts/SourceSans3-Regular.ttf"
 /// Widest text halo kept: walkers draws a halo as 8 copies of the text this far away,
 /// which show as ghost letters beyond about 2 points.
 const MAX_HALO: f64 = 2.0;
+/// Factor on the style's label sizes.
+const TEXT_SCALE: f64 = 1.1;
 
 /// Makes Source Sans the proportional font of `ctx`: map labels (walkers draws them all
 /// in it) and the interface.
@@ -122,6 +124,10 @@ fn full() -> &'static Value {
             // walkers 0.66 reads `source_layer` on circle layers (a missing kebab-case rename).
             if layer["type"] == "circle" {
                 layer["source_layer"] = layer["source-layer"].clone();
+            }
+            // Labels a little larger: at the style's sizes, the letters' pixels show on screen.
+            if let Some(size) = layer["layout"].get_mut("text-size") {
+                *size = json!(["*", TEXT_SCALE, size.take()]);
             }
             let paint = &mut layer["paint"];
             if let Some(width) = paint["text-halo-width"].as_f64() {
