@@ -55,6 +55,8 @@ enum Msg {
     Draped(Frame, &'static str, relief::Result<Vec<image::RgbaImage>>),
     /// The 3D buildings of a block's frame.
     Buildings(Frame, buildings::Mesh),
+    /// How the image export ended.
+    Exported(String),
 }
 
 /// One layer of the stack, with its map tiles.
@@ -132,6 +134,9 @@ struct Blocs {
     draping: HashSet<&'static str>,
     show_3d: bool,
     export_width: u32,
+    /// An export is being saved; then how the last one ended.
+    exporting: bool,
+    export_note: String,
 }
 
 impl Blocs {
@@ -211,6 +216,8 @@ impl Blocs {
             draping: HashSet::new(),
             show_3d: false,
             export_width: EXPORT_WIDTHS[1],
+            exporting: false,
+            export_note: String::new(),
         }
     }
 
@@ -229,6 +236,10 @@ impl Blocs {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Status(text) => self.status = text,
+                Msg::Exported(note) => {
+                    self.exporting = false;
+                    self.export_note = note;
+                }
                 Msg::Places(query, places) => {
                     if query == self.search.trim() {
                         self.places = places;
@@ -535,13 +546,16 @@ impl Blocs {
         let (Some(view), Some(rs)) = (&self.view3d, frame.wgpu_render_state()) else {
             return;
         };
+        // Parented to the window, so that the dialog never opens behind it.
         let Some(path) = rfd::FileDialog::new()
+            .set_parent(frame)
             .set_file_name("bloc.png")
             .add_filter("Image PNG", &["png"])
             .save_file()
         else {
             return;
         };
+        let path = path.with_extension("png");
         let (w, h, rgba) = view.render_image(rs, self.export_width);
         // Cite the layers seen on the image.
         let shown: Vec<_> = (self.stack().into_iter())
@@ -552,9 +566,9 @@ impl Blocs {
             shown.iter().any(|&id| id != "photo"),
             shown.contains(&"photo"),
         );
-        self.status = "Enregistrement de l'image…".into();
+        self.exporting = true;
         self.spawn(move |send| {
-            send(Msg::Status(
+            send(Msg::Exported(
                 match export::save_png(&path, w, h, rgba, &credits) {
                     Ok(()) => format!("Image enregistrée : {}", path.display()),
                     Err(e) => format!("Échec de l'export : {e}"),
@@ -767,8 +781,19 @@ impl Blocs {
                     ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
                 }
             });
-        if ui.button("Exporter…").clicked() {
+        if ui
+            .add_enabled(!self.exporting, egui::Button::new("Exporter…"))
+            .clicked()
+        {
             self.export(frame);
+        }
+        if self.exporting {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("Enregistrement de l'image…");
+            });
+        } else {
+            ui.label(&self.export_note);
         }
     }
 }
@@ -896,6 +921,8 @@ fn load_block(frame: &Frame) -> relief::Result<(Heightmap, String)> {
 /// `blocs` opens the app. Headless commands, for measurements:
 /// `blocs installer D038`, `blocs convertir <archive.7z> D038`, `blocs bloc <lon> <lat>`.
 fn main() -> eframe::Result {
+    // Library warnings and errors (file dialog, GPU…) in the terminal; RUST_LOG for more.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["bloc", lon, lat] => {

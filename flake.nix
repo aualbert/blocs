@@ -11,8 +11,9 @@
     {
       devShells = forAllSystems (pkgs:
         let
-          # Loaded at runtime by winit / wgpu (eframe), not linked.
+          # Loaded at runtime by winit / wgpu (eframe) and rfd's file dialog (dbus), not linked.
           runtimeLibs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [
+            dbus
             wayland
             libxkbcommon
             vulkan-loader
