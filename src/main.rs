@@ -45,8 +45,8 @@ enum Msg {
     Stopped(String),
     /// A block read from disk, with its description, or why it failed.
     Built(Frame, relief::Result<(Heightmap, String)>),
-    /// A layer's image over a block's frame.
-    Draped(Frame, &'static str, relief::Result<image::RgbaImage>),
+    /// A layer's image over a block's frame, with its mipmaps.
+    Draped(Frame, &'static str, relief::Result<Vec<image::RgbaImage>>),
 }
 
 /// One layer of the stack, with its map tiles.
@@ -268,11 +268,11 @@ impl Blocs {
                         continue;
                     }
                     match result {
-                        Ok(image) => {
+                        Ok(levels) => {
                             if let (Some(view), Some(rs)) =
                                 (&self.view3d, frame.wgpu_render_state())
                             {
-                                view.set_layer(rs, id, &image);
+                                view.set_layer(rs, id, &levels);
                                 self.draped.insert(id);
                             }
                         }
@@ -455,7 +455,10 @@ impl Blocs {
                     .unwrap()
                     .store
                     .clone();
-                self.spawn(move |send| send(Msg::Draped(frame, id, drape::drape(&store, &frame))));
+                self.spawn(move |send| {
+                    let image = drape::drape(&store, &frame).map(view3d::mipmaps);
+                    send(Msg::Draped(frame, id, image))
+                });
             } else {
                 plan.push((id, category));
             }
@@ -468,6 +471,7 @@ impl Blocs {
             Ok(tiles) => {
                 for (id, category) in plan {
                     let image = tiles.draw(&style::plan_ign(category), &rs);
+                    let image = image.map(view3d::mipmaps);
                     send(Msg::Draped(frame, id, image));
                 }
             }
@@ -505,12 +509,23 @@ impl Blocs {
             return;
         };
         let (w, h, rgba) = view.render_image(rs, self.export_width);
+        // Cite the layers seen on the image.
+        let shown: Vec<_> = (self.stack().into_iter())
+            .filter(|&(id, opacity)| opacity > 0.0 && self.draped.contains(id))
+            .map(|(id, _)| id)
+            .collect();
+        let credits = export::credits(
+            shown.iter().any(|&id| id != "photo"),
+            shown.contains(&"photo"),
+        );
         self.status = "Enregistrement de l'image…".into();
         self.spawn(move |send| {
-            send(Msg::Status(match export::save_png(&path, w, h, rgba) {
-                Ok(()) => format!("Image enregistrée : {}", path.display()),
-                Err(e) => format!("Échec de l'export : {e}"),
-            }))
+            send(Msg::Status(
+                match export::save_png(&path, w, h, rgba, &credits) {
+                    Ok(()) => format!("Image enregistrée : {}", path.display()),
+                    Err(e) => format!("Échec de l'export : {e}"),
+                },
+            ))
         });
     }
 

@@ -162,9 +162,9 @@ impl View3d {
         }
     }
 
-    /// Hands a layer's draped image to the GPU.
-    pub fn set_layer(&self, rs: &egui_wgpu::RenderState, id: &str, image: &RgbaImage) {
-        let view = image_view(rs, image);
+    /// Hands a layer's draped image, with its `mipmaps`, to the GPU.
+    pub fn set_layer(&self, rs: &egui_wgpu::RenderState, id: &str, levels: &[RgbaImage]) {
+        let view = image_view(rs, levels);
         let mut renderer = rs.renderer.write();
         if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() {
             gpu.layers.insert(id.to_owned(), view);
@@ -614,12 +614,15 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         label: None,
         entries: &entries,
     });
+    // Trilinear, and anisotropic so that layers stay sharp on slopes seen edge-on.
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
         ..Default::default()
     });
-    let blank = image_view(rs, &RgbaImage::new(1, 1));
+    let blank = image_view(rs, &[RgbaImage::new(1, 1)]);
 
     let shader = device.create_shader_module(wgpu::include_wgsl!("terrain.wgsl"));
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -748,19 +751,34 @@ pub fn read_texture(
     rgba
 }
 
-/// An sRGB-coded, premultiplied image as a texture, sampled as is like the shader's colours.
-fn image_view(rs: &egui_wgpu::RenderState, image: &RgbaImage) -> wgpu::TextureView {
+/// The image and its successive halves down to 1 × 1 (mipmaps), so that thin lines and
+/// labels do not flicker on a block seen from afar. Slow on big images: off the UI thread.
+pub fn mipmaps(image: RgbaImage) -> Vec<RgbaImage> {
+    let mut levels = vec![image];
+    while let Some(last) = levels.last().filter(|l| l.width().max(l.height()) > 1) {
+        let (w, h) = ((last.width() / 2).max(1), (last.height() / 2).max(1));
+        // Premultiplied pixels, so plain averaging is right.
+        let half = image::imageops::resize(last, w, h, image::imageops::FilterType::Triangle);
+        levels.push(half);
+    }
+    levels
+}
+
+/// An sRGB-coded, premultiplied image and its mipmaps as a texture, sampled as is like the
+/// shader's colours.
+fn image_view(rs: &egui_wgpu::RenderState, levels: &[RgbaImage]) -> wgpu::TextureView {
+    let data: Vec<u8> = levels.iter().flat_map(|l| l.as_raw()).copied().collect();
     rs.device
         .create_texture_with_data(
             &rs.queue,
             &wgpu::TextureDescriptor {
                 label: Some("calque"),
                 size: wgpu::Extent3d {
-                    width: image.width(),
-                    height: image.height(),
+                    width: levels[0].width(),
+                    height: levels[0].height(),
                     depth_or_array_layers: 1,
                 },
-                mip_level_count: 1,
+                mip_level_count: levels.len() as u32,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Rgba8Unorm,
@@ -768,7 +786,19 @@ fn image_view(rs: &egui_wgpu::RenderState, image: &RgbaImage) -> wgpu::TextureVi
                 view_formats: &[],
             },
             wgpu::util::TextureDataOrder::LayerMajor,
-            image.as_raw(),
+            &data,
         )
         .create_view(&Default::default())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mipmaps_halve_down_to_one_pixel() {
+        let sizes: Vec<_> = super::mipmaps(image::RgbaImage::new(5, 3))
+            .iter()
+            .map(|l| l.dimensions())
+            .collect();
+        assert_eq!(sizes, [(5, 3), (2, 1), (1, 1)]);
+    }
 }

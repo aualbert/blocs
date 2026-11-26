@@ -6,11 +6,30 @@ use ab_glyph::{Font, FontRef, PxScale, ScaleFont, point};
 
 use crate::relief::Result;
 
-pub const CREDITS: &str = "Source : IGN – RGE ALTI® 5 m – Licence Ouverte 2.0";
+/// The sources of a block: always the relief, then the layers seen on it.
+pub fn credits(plan_ign: bool, photo: bool) -> String {
+    let mut sources = vec!["RGE ALTI® 5 m"];
+    if plan_ign {
+        sources.push("Plan IGN");
+    }
+    if photo {
+        sources.push("BD ORTHO®");
+    }
+    format!(
+        "Source : IGN – {} – Licence Ouverte 2.0",
+        sources.join(", ")
+    )
+}
 
-/// Writes the credits in the bottom-right corner, then saves the image.
-pub fn save_png(path: &Path, width: u32, height: u32, mut rgba: Vec<u8>) -> Result<()> {
-    draw_text(&mut rgba, width, height, CREDITS);
+/// Writes `credits` in the bottom-right corner, then saves the image.
+pub fn save_png(
+    path: &Path,
+    width: u32,
+    height: u32,
+    mut rgba: Vec<u8>,
+    credits: &str,
+) -> Result<()> {
+    draw_text(&mut rgba, width, height, credits);
     image::save_buffer(path, &rgba, width, height, image::ColorType::Rgba8)?;
     Ok(())
 }
@@ -61,4 +80,19 @@ fn blend(px: &mut [u8], color: [u8; 3], a: f32) {
         px[c] = ((color[c] as f32 * a + px[c] as f32 * below * (1.0 - a)) / out).round() as u8;
     }
     px[3] = (out * 255.0).round() as u8;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn credits_cite_the_layers_seen() {
+        assert_eq!(
+            super::credits(true, true),
+            "Source : IGN – RGE ALTI® 5 m, Plan IGN, BD ORTHO® – Licence Ouverte 2.0"
+        );
+        assert_eq!(
+            super::credits(false, false),
+            "Source : IGN – RGE ALTI® 5 m – Licence Ouverte 2.0"
+        );
+    }
 }
