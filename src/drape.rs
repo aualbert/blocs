@@ -31,6 +31,8 @@ const THREADS: usize = 6;
 const SCREEN: f64 = 1500.0;
 /// Plan IGN tiles are 512 px, one level above walkers' 256 px map zoom.
 const PLAN_TILE: u32 = 512;
+/// Coarsest tile level with all buildings: below, the Plan IGN keeps only the large ones.
+const BUILDINGS_LEVEL: u8 = 14;
 /// Equator length (m).
 const EARTH: f64 = 40_075_016.7;
 
@@ -86,9 +88,15 @@ impl PlanIgn {
         })
     }
 
-    /// The 3D buildings of the frame, from the same tiles as the draped Plan IGN.
-    pub fn buildings(&self) -> crate::buildings::Mesh {
-        crate::buildings::mesh(self.zoom - 1, &self.tiles, &self.frame)
+    /// The 3D buildings of the frame: from the draped Plan IGN's tiles, or from finer ones
+    /// fetched for them when a large frame's tiles lack the small buildings.
+    pub fn buildings(&self, store: &Store) -> Result<crate::buildings::Mesh> {
+        let level = self.zoom - 1;
+        if level >= BUILDINGS_LEVEL {
+            return Ok(crate::buildings::mesh(level, &self.tiles, &self.frame));
+        }
+        let tiles = fetch(store, &crate::ign::client()?, &self.frame, BUILDINGS_LEVEL);
+        Ok(crate::buildings::mesh(BUILDINGS_LEVEL, &tiles, &self.frame))
     }
 
     /// The Plan IGN drawn with `style` over the frame, rows north to south, premultiplied.

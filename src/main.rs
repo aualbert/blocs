@@ -498,7 +498,10 @@ impl Blocs {
             Ok(tiles) => {
                 for (id, category) in plan {
                     if id == BUILDINGS {
-                        send(Msg::Buildings(frame, tiles.buildings()));
+                        match tiles.buildings(&store) {
+                            Ok(mesh) => send(Msg::Buildings(frame, mesh)),
+                            Err(e) => send(Msg::Draped(frame, id, Err(e))),
+                        }
                         continue;
                     }
                     let image = tiles.draw(&style::plan_ign(category), &rs);
