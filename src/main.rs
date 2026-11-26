@@ -770,7 +770,7 @@ impl Blocs {
         ui.label("Étirement du relief");
         ui.add(egui::Slider::new(&mut view.exaggeration, 1.0..=2.0).prefix("×"));
         ui.label("Profondeur du socle");
-        ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=2000.0).suffix(" m"));
+        ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=1000.0).suffix(" m"));
         ui.separator();
         ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil");
         ui.separator();

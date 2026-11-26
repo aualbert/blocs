@@ -73,7 +73,7 @@ Vingt-sept exigences décrivent la v1 hors couches. Les exigences sur les couche
 | NAV-1 | Projection axonométrique (orthographique) unique, celle des blocs diagrammes dessinés : sans point de fuite, une seule échelle sur tout le bloc ; orientation libre, la vue isométrique en est un cas particulier |
 | NAV-2 | Orientation libre à la souris : rotation, inclinaison, zoom, déplacement. Molette : zoom ; Maj + molette : déplacement gauche-droite ; Ctrl + molette : déplacement haut-bas. Même convention sur la carte et en 3D |
 | NAV-3 | Widget d'axes de navigation façon Blender / Godot : un clic sur un axe aligne la vue |
-| REG-1 | Curseur vertical unique à droite de la vue 3D, à deux poignées : étirement du relief (exagération x1 à x2, défaut proposé x1,5) et profondeur du socle (jusqu'à 2 000 m) |
+| REG-1 | Curseur vertical unique à droite de la vue 3D, à deux poignées : étirement du relief (exagération x1 à x2, défaut proposé x1,5) et profondeur du socle (jusqu'à 1 000 m) |
 | REG-2 | Azimut et hauteur du soleil |
 | REG-3 | Ombres portées du relief |
 | EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 ou 3 840 px de large |
