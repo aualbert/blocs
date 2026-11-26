@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+dirs = "7.0.0"
 eframe = "0.37"
+glam = "0.34.3"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+sevenz-rust2 = { version = "0.27.0", default-features = false }
 walkers = "0.66.0"
 wgpu = "30"
