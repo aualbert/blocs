@@ -6,6 +6,7 @@ mod lambert93;
 mod layers;
 mod map;
 mod relief;
+mod shadow;
 mod style;
 mod sun;
 mod tiles;

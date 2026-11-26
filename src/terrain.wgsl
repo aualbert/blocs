@@ -20,6 +20,9 @@ struct Uniforms {
 @group(0) @binding(8) var layer5: texture_2d<f32>;
 @group(0) @binding(9) var layer6: texture_2d<f32>;
 @group(0) @binding(10) var layer7: texture_2d<f32>;
+// Where the sun reaches the surface (shadow.rs), and its spacing in grid points.
+@group(0) @binding(11) var shadows: texture_2d<f32>;
+const SHADOW_STEP: f32 = 2.0;
 
 // Vertex kinds, see view3d.rs.
 const SURFACE: u32 = 0u;
@@ -35,6 +38,8 @@ struct Out {
     @location(2) uv: vec2<f32>,
     // 1 on the surface, which takes the layers; 0 on walls and floor.
     @location(3) surface: f32,
+    // Position in metres, x east, y up, z south: for the shadows.
+    @location(4) world: vec3<f32>,
 };
 
 fn height(i: i32, j: i32) -> f32 {
@@ -88,6 +93,7 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
         }
     }
     out.pos = u.view_proj * vec4(p, 1.0);
+    out.world = p;
     return out;
 }
 
@@ -113,6 +119,7 @@ fn vs_building(
 
     var out: Out;
     out.pos = u.view_proj * vec4(p, 1.0);
+    out.world = p;
     out.uv = vec2(grid.x, u.grid.y - 1.0 - grid.y) / (u.grid.xy - 1.0);
     // Roofs face up, walls face out (north being -z); all plain light grey.
     let is_roof = all(normal == vec2(0.0));
@@ -125,6 +132,20 @@ fn vs_building(
 // Lays one layer (premultiplied alpha) over the colour below, as the map does.
 fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
     return below * (1.0 - layer.a * opacity) + layer.rgb * opacity;
+}
+
+// Share of direct sunlight at `p`: the relief's shadows, cast every SHADOW_STEP points.
+fn sunlit(p: vec3<f32>) -> f32 {
+    let half = (u.grid.xy - 1.0) * 0.5;
+    let g = vec2(p.x / u.params.z + half.x, half.y - p.z / u.params.z);
+    let size = vec2<f32>(textureDimensions(shadows));
+    let uv = (g / SHADOW_STEP + 0.5) / size;
+    // Four samples around, blurring the grid's steps away.
+    let d = 0.6 / size;
+    return 0.25 * (textureSampleLevel(shadows, samp, uv + vec2(-d.x, -d.y), 0.0).r
+        + textureSampleLevel(shadows, samp, uv + vec2(d.x, -d.y), 0.0).r
+        + textureSampleLevel(shadows, samp, uv + vec2(-d.x, d.y), 0.0).r
+        + textureSampleLevel(shadows, samp, uv + vec2(d.x, d.y), 0.0).r);
 }
 
 @fragment
@@ -142,6 +163,7 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     let color = mix(in.color, c, in.surface);
 
     // The 3D light shades the layers; none of them carries baked shading.
-    let light = 0.35 + 0.65 * max(dot(normalize(in.normal), u.sun.xyz), 0.0);
+    let direct = max(dot(normalize(in.normal), u.sun.xyz), 0.0) * sunlit(in.world);
+    let light = 0.35 + 0.65 * direct;
     return vec4(color * light, 1.0);
 }

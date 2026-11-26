@@ -15,6 +15,7 @@ use wgpu::util::DeviceExt;
 
 use crate::buildings;
 use crate::relief::{CELL, Heightmap};
+use crate::shadow;
 use crate::sun::Sun;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -58,6 +59,8 @@ struct Gpu {
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     heights: wgpu::TextureView,
+    /// Where the sun reaches the surface, see shadow.rs.
+    shadows: wgpu::Texture,
     sampler: wgpu::Sampler,
     /// Transparent 1 × 1 image for empty slots.
     blank: wgpu::TextureView,
@@ -94,6 +97,9 @@ pub struct View3d {
     /// Opacity of each layer slot, bottom first.
     opacity: [f32; SLOTS],
     sun: Sun,
+    /// The block's heights, and the sun and exaggeration its shadows were cast for.
+    heights: Vec<f32>,
+    shadows_for: Option<(Vec3, f32)>,
     /// The on-screen image and its egui id, remade when the view changes size.
     screen: Option<(Arc<Target>, egui::TextureId)>,
 }
@@ -175,7 +181,34 @@ impl View3d {
                 (latitude as f32).to_radians(),
                 Vec3::new(-0.5, 0.6, 0.6).normalize(),
             ),
+            heights: map.heights.clone(),
+            shadows_for: None,
             screen: None,
+        }
+    }
+
+    /// Casts the relief's shadows again if the sun or the exaggeration changed.
+    fn update_shadows(&mut self, rs: &egui_wgpu::RenderState) {
+        let key = (self.sun.dir(), self.exaggeration);
+        if self.shadows_for == Some(key) {
+            return;
+        }
+        self.shadows_for = Some(key);
+        let (nx, ny) = (self.points.0 as usize, self.points.1 as usize);
+        let mask = shadow::mask(&self.heights, nx, ny, key.0, key.1);
+        let renderer = rs.renderer.read();
+        if let Some(gpu) = renderer.callback_resources.get::<Gpu>() {
+            let mx = shadow::size(nx, ny).0;
+            rs.queue.write_texture(
+                gpu.shadows.as_image_copy(),
+                &mask,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(mx as u32),
+                    rows_per_image: None,
+                },
+                gpu.shadows.size(),
+            );
         }
     }
 
@@ -266,6 +299,7 @@ impl View3d {
         }
 
         // Draw the block into its image before egui's pass, then show that image.
+        self.update_shadows(rs);
         let size = (rect.size() * ui.pixels_per_point()).round();
         let size = [size.x.max(1.0) as u32, size.y.max(1.0) as u32];
         let target = self.screen_target(rs, size);
@@ -551,6 +585,11 @@ impl Gpu {
                 resource: wgpu::BindingResource::TextureView(view.unwrap_or(&self.blank)),
             });
         }
+        let shadows = self.shadows.create_view(&Default::default());
+        entries.push(wgpu::BindGroupEntry {
+            binding: 3 + SLOTS as u32,
+            resource: wgpu::BindingResource::TextureView(&shadows),
+        });
         self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -673,6 +712,21 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         wgpu::util::TextureDataOrder::LayerMajor,
         bytemuck::cast_slice(&map.heights),
     );
+    let (mx, my) = shadow::size(map.nx, map.ny);
+    let shadows = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ombres"),
+        size: wgpu::Extent3d {
+            width: mx as u32,
+            height: my as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("uniforms"),
         size: size_of::<Uniforms>() as u64,
@@ -709,7 +763,8 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             count: None,
         },
     ];
-    for slot in 0..SLOTS {
+    // The layers, then the shadows.
+    for slot in 0..=SLOTS {
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 3 + slot as u32,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -814,6 +869,7 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         bind_group,
         uniforms,
         heights: texture.create_view(&Default::default()),
+        shadows,
         sampler,
         blank,
         layers: HashMap::new(),
