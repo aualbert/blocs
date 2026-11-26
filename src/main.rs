@@ -1,8 +1,11 @@
+mod drape;
 mod export;
 mod ign;
 mod lambert93;
+mod layers;
 mod map;
 mod relief;
+mod style;
 mod tiles;
 mod view3d;
 
@@ -16,9 +19,11 @@ use eframe::egui;
 use walkers::{Map, MapMemory, lon_lat};
 
 use ign::Place;
+use layers::Source;
 use map::{Edit, Frame, FrameTool};
 use relief::{Heightmap, Progress};
-use tiles::PlanIgn;
+use style::Category;
+use tiles::{PlanIgnTiles, Store, TileLayer};
 use view3d::View3d;
 
 /// Map centre at start-up.
@@ -40,6 +45,25 @@ enum Msg {
     Stopped(String),
     /// A block read from disk, with its description, or why it failed.
     Built(Frame, relief::Result<(Heightmap, String)>),
+    /// A layer's image over a block's frame.
+    Draped(Frame, &'static str, relief::Result<image::RgbaImage>),
+}
+
+/// One layer of the stack, with its map tiles.
+struct MapLayer {
+    id: &'static str,
+    name: &'static str,
+    visible: bool,
+    opacity: f32,
+    store: Store,
+    tiles: MapTiles,
+}
+
+/// How a layer is drawn on the map.
+enum MapTiles {
+    Images(TileLayer),
+    /// Vector tiles styled by walkers (the Plan IGN).
+    Styled(walkers::StyledSources),
 }
 
 /// Départements to download for the frame last queried.
@@ -64,7 +88,10 @@ struct Blocs {
     rx: Receiver<Msg>,
     status: String,
 
-    tiles: PlanIgn,
+    /// The layer stack, top first: Plan IGN categories, then the photo.
+    layers: Vec<MapLayer>,
+    /// The Plan IGN's opaque background, drawn when the photo is not.
+    background: walkers::StyledSources,
     map_memory: MapMemory,
     frame: Option<Frame>,
     edit: Option<Edit>,
@@ -82,6 +109,9 @@ struct Blocs {
     view3d: Option<View3d>,
     built: Option<Frame>,
     building: bool,
+    /// Layers whose image is on the block, and those being prepared.
+    draped: HashSet<&'static str>,
+    draping: HashSet<&'static str>,
     show_3d: bool,
     export_width: u32,
 }
@@ -96,12 +126,44 @@ impl Blocs {
             o.input_options.vertical_scroll_modifier = egui::Modifiers::CTRL;
         });
         let (tx, rx) = channel();
+        std::thread::spawn(tiles::trim_cache);
+        // walkers draws vector tiles with its own wgpu pipeline.
+        walkers::install_renderer(cc.wgpu_render_state.as_ref());
+        // The Plan IGN categories, top first, all drawn from one download; the photo below.
+        let ctx = cc.egui_ctx.clone();
+        let plan = Store::new("planign", Source::PlanIgn);
+        let plan_tiles = PlanIgnTiles::new(ctx.clone(), plan.clone());
+        let styled = |category| {
+            walkers::StyledSources::new(style::plan_ign(category), ctx.clone())
+                .with_tiled_source(style::SOURCE, plan_tiles.clone())
+        };
+        let mut layers: Vec<MapLayer> = (Category::ALL.iter().rev())
+            .map(|&c| MapLayer {
+                id: c.id(),
+                name: c.name(),
+                visible: true,
+                opacity: 1.0,
+                store: plan.clone(),
+                tiles: MapTiles::Styled(styled(Some(c))),
+            })
+            .collect();
+        let photo = Store::new("photo", layers::PHOTO);
+        layers.push(MapLayer {
+            id: "photo",
+            name: "Photo aérienne",
+            visible: false,
+            opacity: 1.0,
+            tiles: MapTiles::Images(TileLayer::new(ctx.clone(), photo.clone())),
+            store: photo,
+        });
+        let background = styled(None);
         Self {
             ctx: cc.egui_ctx.clone(),
             tx,
             rx,
             status: String::new(),
-            tiles: PlanIgn::new(cc.egui_ctx.clone()),
+            layers,
+            background,
             map_memory,
             frame: None,
             edit: None,
@@ -123,6 +185,8 @@ impl Blocs {
             view3d: None,
             built: None,
             building: false,
+            draped: HashSet::new(),
+            draping: HashSet::new(),
             show_3d: false,
             export_width: EXPORT_WIDTHS[1],
         }
@@ -188,13 +252,41 @@ impl Blocs {
                         self.status = format!("Téléchargement interrompu : {error}");
                     }
                 }
+                Msg::Draped(built, id, result) => {
+                    self.draping.remove(id);
+                    // A layer for an older block is dropped; the current one asks again.
+                    if self.built != Some(built) {
+                        continue;
+                    }
+                    match result {
+                        Ok(image) => {
+                            if let (Some(view), Some(rs)) =
+                                (&self.view3d, frame.wgpu_render_state())
+                            {
+                                view.set_layer(rs, id, &image);
+                                self.draped.insert(id);
+                            }
+                        }
+                        Err(e) => {
+                            // Not retried for this block: moving the frame or reopening asks again.
+                            self.draped.insert(id);
+                            self.status = format!("Calque indisponible sur le bloc : {e}");
+                        }
+                    }
+                }
                 Msg::Built(built, result) => {
                     self.building = false;
                     match result {
                         Ok((map, text)) => {
                             let start = Instant::now();
                             let rs = frame.wgpu_render_state().expect("rendu wgpu");
+                            if let Some(old) = &mut self.view3d {
+                                old.release(rs);
+                            }
                             self.view3d = Some(View3d::new(rs, &map));
+                            // The new block starts without layer images.
+                            self.draped.clear();
+                            self.draping.clear();
                             self.status = format!(
                                 "{text} · envoyé au GPU en {:.2} s",
                                 start.elapsed().as_secs_f64()
@@ -329,6 +421,27 @@ impl Blocs {
             self.status = "Construction du bloc…".into();
             self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
         }
+    }
+
+    /// Prepares the block image of each visible layer that has none yet.
+    fn drape_visible(&mut self) {
+        let Some(frame) = self.built else { return };
+        // Only image layers for now: the Plan IGN needs off-screen rendering, still to come.
+        let jobs: Vec<_> = (self.layers.iter())
+            .filter(|l| matches!(*l.store.source, Source::Image { .. }))
+            .filter(|l| l.visible && !self.draped.contains(l.id) && !self.draping.contains(l.id))
+            .map(|l| (l.id, l.store.clone()))
+            .collect();
+        for (id, store) in jobs {
+            self.draping.insert(id);
+            self.spawn(move |send| send(Msg::Draped(frame, id, drape::drape(&store, &frame))));
+        }
+    }
+
+    /// The visible layers, bottom first, with their opacity.
+    fn stack(&self) -> Vec<(&'static str, f32)> {
+        let visible = self.layers.iter().rev().filter(|l| l.visible);
+        visible.map(|l| (l.id, l.opacity)).collect()
     }
 
     fn export(&mut self, frame: &eframe::Frame) {
@@ -507,7 +620,37 @@ impl Blocs {
         });
     }
 
+    /// The layers, top first, each shown or hidden, with its opacity. Their order is
+    /// IGN's cartographic one, the photo always at the bottom.
+    fn layers_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Calques");
+        if self.map_memory.zoom() < layers::STACK_ZOOM as f64 {
+            ui.label("Vue d'ensemble : Plan IGN complet.\nZoomez pour choisir les calques.");
+        }
+        for layer in &mut self.layers {
+            ui.checkbox(&mut layer.visible, layer.name);
+            ui.add_enabled(
+                layer.visible,
+                egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
+                    .show_value(false)
+                    .text("opacité"),
+            );
+            ui.separator();
+        }
+    }
+
     fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        if !self.draping.is_empty() {
+            let names: Vec<_> = (self.layers.iter())
+                .filter(|l| self.draping.contains(l.id))
+                .map(|l| l.name)
+                .collect();
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(format!("Préparation : {}", names.join(", ")));
+            });
+            ui.separator();
+        }
         let Some(view) = &mut self.view3d else { return };
         ui.label("Étirement du relief");
         ui.add(egui::Slider::new(&mut view.exaggeration, 1.0..=2.0).prefix("×"));
@@ -534,17 +677,21 @@ impl eframe::App for Blocs {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll(frame);
         self.refresh_lookup();
+        self.drape_visible();
 
         egui::Panel::top("barre").show(ui, |ui| self.top_bar(ui));
 
         if self.show_3d && self.view3d.is_some() {
             egui::Panel::right("réglages").show(ui, |ui| self.settings_3d(ui, frame));
-            if let Some(view) = &mut self.view3d {
-                view.ui(ui);
+            let stack = self.stack();
+            if let (Some(view), Some(rs)) = (&mut self.view3d, frame.wgpu_render_state()) {
+                view.set_stack(rs, &stack);
+                view.ui(ui, rs);
             }
             return;
         }
 
+        egui::Panel::left("calques").show(ui, |ui| self.layers_panel(ui));
         self.download_bar(ui);
         // Shift + wheel pans east-west, Ctrl + wheel north-south; the plain wheel zooms.
         let scroll = ui.input(|i| i.smooth_scroll_delta);
@@ -556,13 +703,12 @@ impl eframe::App for Blocs {
             map::pan(&mut self.map_memory, lon_lat(START.0, START.1), scroll);
             ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
         }
+        // White under the map, where tiles have not arrived yet.
+        ui.painter()
+            .rect_filled(ui.available_rect_before_wrap(), 0.0, egui::Color32::WHITE);
         let pan = !self.drawing && self.edit.is_none();
-        ui.add(
-            Map::new(
-                Some(&mut self.tiles),
-                &mut self.map_memory,
-                lon_lat(START.0, START.1),
-            )
+        let overview = self.map_memory.zoom() < layers::STACK_ZOOM as f64;
+        let mut map = Map::new(None, &mut self.map_memory, lon_lat(START.0, START.1))
             // walkers defaults to Ctrl + wheel zoom and plain-wheel panning.
             .zoom_with_ctrl(false)
             .drag_pan_buttons(if pan {
@@ -574,8 +720,25 @@ impl eframe::App for Blocs {
                 frame: &mut self.frame,
                 edit: &mut self.edit,
                 drawing: &mut self.drawing,
-            }),
-        );
+            });
+        // Zoomed out, the whole Plan IGN kept on disk; zoomed in, the chosen layers, bottom
+        // first. The Plan IGN's white background would hide the photo, so it goes without.
+        let photo = self.layers.iter().any(|l| l.id == "photo" && l.visible);
+        if overview || !photo {
+            map = map.with_layer(&mut self.background, 1.0);
+        }
+        for layer in self.layers.iter_mut().rev() {
+            let opacity = match overview {
+                true if layer.id != "photo" => 1.0,
+                false if layer.visible => layer.opacity,
+                _ => continue,
+            };
+            map = match &mut layer.tiles {
+                MapTiles::Images(tiles) => map.with_layer(tiles, opacity),
+                MapTiles::Styled(styled) => map.with_layer(styled, opacity),
+            };
+        }
+        ui.add(map);
     }
 }
 
@@ -631,7 +794,6 @@ fn main() -> eframe::Result {
         _ => {
             let options = eframe::NativeOptions {
                 viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
-                depth_buffer: 24, // matches view3d::DEPTH_FORMAT
                 ..Default::default()
             };
             eframe::run_native(

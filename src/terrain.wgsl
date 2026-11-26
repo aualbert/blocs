@@ -5,10 +5,19 @@ struct Uniforms {
     params: vec4<f32>, // exaggeration, base depth (m), cell (m), unused
     grid: vec4<f32>,   // points east, points north, min height, max height (m)
     sun: vec4<f32>,    // direction towards the sun
+    opacity: array<vec4<f32>, 2>, // per layer slot, bottom first
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 @group(0) @binding(1) var heights: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
+// Layer images draped on the surface, bottom first (SLOTS in view3d.rs).
+@group(0) @binding(3) var layer0: texture_2d<f32>;
+@group(0) @binding(4) var layer1: texture_2d<f32>;
+@group(0) @binding(5) var layer2: texture_2d<f32>;
+@group(0) @binding(6) var layer3: texture_2d<f32>;
+@group(0) @binding(7) var layer4: texture_2d<f32>;
+@group(0) @binding(8) var layer5: texture_2d<f32>;
 
 // Vertex kinds, see view3d.rs.
 const SURFACE: u32 = 0u;
@@ -20,6 +29,10 @@ struct Out {
     @builtin(position) pos: vec4<f32>,
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
+    // Position in the layer images: 0..1 west to east, north to south.
+    @location(2) uv: vec2<f32>,
+    // 1 on the surface, which takes the layers; 0 on walls and floor.
+    @location(3) surface: f32,
 };
 
 fn height(i: i32, j: i32) -> f32 {
@@ -50,12 +63,14 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
     // x east, y up, z south; heights relative to the block's lowest point.
     var p = vec3((f32(i) - half.x) * cell, (h - u.grid.z) * exag, (half.y - f32(j)) * cell);
     var out: Out;
+    out.uv = vec2(f32(i), u.grid.y - 1.0 - f32(j)) / (u.grid.xy - 1.0);
     switch kind_side.x {
         case SURFACE: {
             let dx = (height(i + 1, j) - height(i - 1, j)) * exag / (2.0 * cell);
             let dz = (height(i, j - 1) - height(i, j + 1)) * exag / (2.0 * cell);
             out.normal = normalize(vec3(-dx, 1.0, -dz));
             out.color = tint(h);
+            out.surface = 1.0;
         }
         case FLOOR: {
             p.y = -u.params.y;
@@ -74,8 +89,24 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
     return out;
 }
 
+// Lays one layer over the colour below, as the map does.
+fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
+    return mix(below, layer.rgb, layer.a * opacity);
+}
+
 @fragment
 fn fs_main(in: Out) -> @location(0) vec4<f32> {
+    // Every slot is sampled (empty ones are transparent), keeping control flow uniform.
+    var c = in.color;
+    c = over(c, textureSample(layer0, samp, in.uv), u.opacity[0].x);
+    c = over(c, textureSample(layer1, samp, in.uv), u.opacity[0].y);
+    c = over(c, textureSample(layer2, samp, in.uv), u.opacity[0].z);
+    c = over(c, textureSample(layer3, samp, in.uv), u.opacity[0].w);
+    c = over(c, textureSample(layer4, samp, in.uv), u.opacity[1].x);
+    c = over(c, textureSample(layer5, samp, in.uv), u.opacity[1].y);
+    let color = mix(in.color, c, in.surface);
+
+    // The 3D light shades the layers; none of them carries baked shading.
     let light = 0.35 + 0.65 * max(dot(normalize(in.normal), u.sun.xyz), 0.0);
-    return vec4(in.color * light, 1.0);
+    return vec4(color * light, 1.0);
 }

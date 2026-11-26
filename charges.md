@@ -44,7 +44,7 @@ Le parcours nominal tient en huit étapes ; le téléchargement (étape 4) n'a l
 2. Il cherche un lieu ou zoome sur la carte.
 3. Il trace un cadre rectangulaire ; ses dimensions s'affichent en km et le cadre ne dépasse pas 10 km.
 4. Si le relief manque, l'app propose aussitôt de télécharger le ou les départements nécessaires au cadre, avec la taille totale ; il accepte d'un clic.
-5. Il active, masque ou réordonne les couches sur la carte, et peut les télécharger pour l'emprise du cadre.
+5. Il affiche, masque ou atténue les calques sur la carte, et peut les télécharger pour l'emprise du cadre.
 6. Il passe en vue 3D en un clic, ou affiche carte et 3D côte à côte ; le bloc apparaît avec les couches appliquées sur le terrain.
 7. En 3D, il oriente le bloc à la souris ou avec le widget d'axes, règle le soleil et, sur le curseur vertical, l'étirement du relief et les profondeurs.
 8. Il exporte une image PNG à fond transparent, sources citées automatiquement.
@@ -65,7 +65,7 @@ Vingt-sept exigences décrivent la v1 hors couches. Les exigences sur les couche
 | TEL-1 | Une fois le cadre tracé, proposition de télécharger le relief RGE ALTI 5 m des seuls départements nécessaires au cadre, taille annoncée ; un seul bouton « Télécharger », sans case à cocher ni bouton « Plus tard » ; la proposition s'affiche immédiatement, la taille suit dès qu'elle est connue |
 | TEL-2 | Cadre à cheval sur plusieurs départements : on propose le plus petit ensemble d'archives qui couvre le cadre. Une archive contient toutes les dalles de 5 km qui touchent son département ; un département voisin n'est proposé que si une dalle du cadre ne touche aucun département déjà retenu ou installé (ex. Clécy : le Calvados suffit) |
 | TEL-3 | Progression, pause et reprise du téléchargement ; décompression et conversion automatiques |
-| TEL-4 | Téléchargement des couches (photo aérienne, Plan IGN, BD TOPO) pour l'emprise du cadre |
+| TEL-4 | Téléchargement des calques (photo aérienne, Plan IGN) pour l'emprise du cadre |
 | STO-1 | Écran de gestion : départements et zones téléchargés, taille, suppression, dossier de stockage au choix |
 | GEN-1 | Bloc 3D à 5 m, pleine résolution, construit depuis les données locales |
 | GEN-2 | Socle fermé (faces latérales et dessous) |
@@ -79,19 +79,19 @@ Vingt-sept exigences décrivent la v1 hors couches. Les exigences sur les couche
 | EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 ou 3 840 px de large |
 | EXP-2 | Crédits des sources incrustés sur l'image (ex. « Source : IGN – Licence Ouverte ») |
 | EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages) |
-| CAR-1 | Fond Plan IGN mis en cache sur le disque : les niveaux 0 à 10 sur la France sont gardés en permanence ; les tuiles plus fines partagent un cache plafonné (500 Mo), les moins récemment vues effacées en premier |
-| CAR-2 | Les niveaux 0 à 10 de la France métropolitaine (\~100 à 150 Mo) sont téléchargés une fois, en tâche de fond : vues d'ensemble immédiates et disponibles hors connexion |
-| CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide |
+| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo), les moins récemment vues effacées en premier |
+| CAR-2 | Les niveaux 0 à 10 du Plan IGN vectoriel sur la France métropolitaine (\~95 Mo, dont 89 Mo pour le niveau 10) sont téléchargés une fois, en tâche de fond : vues d'ensemble immédiates et disponibles hors connexion |
+| CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide ; fond de carte blanc. Plan IGN dessiné en tuiles de 512 px, comme le prévoit son style : détails et toponymes apparaissent un niveau de zoom plus tard, pour une carte moins chargée |
 
 ## Système de calques
 
-Les couches se gèrent uniquement dans la vue Carte ; la vue 3D les applique telles quelles sur le terrain du bloc. Chaque couche porte son propre style. Au premier lancement, la pile contient la photo aérienne et les cours d'eau (visibles), les forêts et le Plan IGN (masqués).
+Les calques se gèrent uniquement dans la vue Carte ; la vue 3D les applique tels quels sur le terrain du bloc. La pile se compose de la photo aérienne, toujours en dessous, et du Plan IGN vectoriel découpé en catégories, de haut en bas : toponymes, limites, routes et voies ferrées, bâti, eau, relief, végétation. Au premier lancement, toutes les catégories sont visibles et la photo aérienne masquée. En vue d'ensemble (niveaux de zoom inférieurs à 11), la carte montre le Plan IGN complet, quels que soient les calques choisis.
 
 | ID | Exigence |
 | --- | --- |
-| CAL-1 | Pile de couches ordonnée : visibilité, opacité, ordre par glisser-déposer |
-| CAL-2 | Couches raster drapées (photo aérienne, Plan IGN, ombrage, teintes d'altitude, pentes) avec mode de fusion (normal, produit) |
-| CAL-3 | Couches vecteur drapées (cours d'eau, plans d'eau, zones boisées) avec style propre : couleur, épaisseur, remplissage |
+| CAL-1 | Pile de calques : visibilité et opacité de chaque calque, sans délai. Ordre fixe : celui du Plan IGN, la photo aérienne toujours en dessous |
+| CAL-2 | Plan IGN vectoriel drapé, dessiné avec le style officiel de l'IGN et découpé en catégories selon les données des tuiles. Pas d'ombrage : l'éclairage de la 3D fait les ombres, un ombrage précalculé les doublerait (le Plan IGN en images, ombré, est écarté pour cette raison). Le fond blanc du Plan IGN n'est dessiné que si la photo aérienne est masquée |
+| CAL-3 | Photo aérienne drapée, seul calque image ; elle garde ses ombres naturelles. Reportés : styles réglables des catégories (couleur, épaisseur, remplissage), teintes d'altitude, mode de fusion (produit) |
 | CAL-4 | Import de fichiers : GeoTIFF, PNG / JPEG géoréférencé, GeoJSON, GPX, KML, GeoPackage, Shapefile |
 | CAL-5 | Reprojection automatique vers Lambert-93 depuis WGS84 et Web Mercator ; message clair si la projection est inconnue |
 
@@ -103,8 +103,8 @@ Toutes les données par défaut viennent de l'IGN, sous Licence Ouverte 2.0 : r�
 | --- | --- | --- | --- | --- |
 | [RGE ALTI 5 m](https://geoservices.ign.fr/rgealti) | Relief du bloc | 5 m | Archives 7z par département (fichiers ASC, Lambert-93 / IGN69), service de téléchargement Géoplateforme | Mise à jour arrêtée en 2024 ; vide (nodata) sur les zones interdites (ZICAD) |
 | BD ORTHO | Couche photo aérienne | 20 cm à 50 cm (à confirmer) | WMTS, tuiles téléchargées pour l'emprise du cadre | Tuiles à reprojeter sur le maillage |
-| Plan IGN | Fond de la vue Carte, couche carte | Multi-échelle | WMTS / tuiles vectorielles | Niveaux 0 à 10 gardés sur le disque, cache plafonné au-delà (CAR-1) |
-| BD TOPO | Cours d'eau, plans d'eau, zones boisées | Vecteur métrique | WFS, objets téléchargés pour l'emprise du cadre | Couches à choisir dans le catalogue WFS |
+| [Plan IGN vectoriel](https://data.geopf.fr/tms/1.0.0/PLAN.IGN) | Fond de la vue Carte, calques par catégorie | Multi-échelle | Tuiles vectorielles PLAN.IGN (TMS, niveaux 0 à 18) et style officiel « standard » de l'IGN, embarqué dans l'application | Sans ombrage ; niveaux 0 à 10 gardés sur le disque, cache plafonné au-delà (CAR-1) ; style converti à la volée pour walkers |
+| BD TOPO | Eau en coupe (GEN-3), si les tuiles du Plan IGN ne suffisent pas | Vecteur métrique | Tuiles vectorielles « BD TOPO® personnalisable » (TMS, niveaux 4 à 19) | Plus utilisée pour les calques, que le Plan IGN couvre |
 | [Géocodage Géoplateforme](https://www.data.gouv.fr/dataservices/api-geoplateforme-geocodage/discussions) | Recherche de lieu | — | REST `data.geopf.fr/geocodage` | Remplace l'API Adresse historique |
 
 Sources : [Référentiel à grande échelle (RGE) sur data.gouv.fr](https://www.data.gouv.fr/datasets/58e5842688ee386c65805755) · [Documentation des géoservices IGN](https://geoservices.ign.fr/usages)
@@ -125,7 +125,7 @@ Le relief étant local, la construction du bloc ne dépend pas du réseau ; le t
 | Prise en main | Premier bloc obtenu sans aide ; interface en français, textes prêts pour la traduction |
 | Distribution | Binaires signés : notarisation Apple (compte développeur payant), signature Windows ; AppImage ou Flatpak sous Linux |
 | Licence du code | GPL-3.0 |
-| Technologie | Rust ; interface egui (eframe), vue Carte avec walkers (tuiles IGN en Web Mercator), vue 3D en wgpu |
+| Technologie | Rust ; interface egui (eframe), vue Carte avec walkers (tuiles IGN en Web Mercator, style vectoriel MapLibre), vue 3D en wgpu |
 
 ## Risques et points de vigilance
 
@@ -152,7 +152,7 @@ Sans échéance imposée, le projet avance par jalons ; chacun se termine par un
    - Critère : taille et durée du téléchargement mesurées ; bloc affiché depuis le disque.
 2. **Version minimale** : vue Carte avec recherche et cadre, proposition de téléchargement, vue 3D avec socle, projection axonométrique, orientation et widget d'axes, export PNG à fond transparent.
    - Critère : un testeur non spécialiste obtient et exporte un bloc seul.
-3. **Couches et écran partagé** : pile complète sur la carte, BD TOPO, styles, couches appliquées en 3D, carte et 3D côte à côte.
+3. **Calques et écran partagé** : d'abord la pile de calques (photo aérienne et Plan IGN vectoriel par catégories) sur la carte, reprise telle quelle par le bloc ; puis styles, eau en coupe, carte et 3D côte à côte.
    - Critère : un changement de couche sur la carte apparaît sur le bloc sans reconstruction complète.
 4. **Hors connexion et imports** : téléchargement des couches pour l'emprise du cadre, écran de gestion du stockage, imports de fichiers.
    - Critère : un bloc complet se reconstruit sans réseau.

@@ -3,16 +3,24 @@
 //! Parallel (axonometric) projection only, as in hand-drawn block diagrams: no vanishing
 //! point, one scale across the whole block.
 
+use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI};
+use std::sync::Arc;
 
 use eframe::{egui, egui_wgpu, wgpu};
 use glam::Vec3;
 use glam::camera::rh::{proj::directx::orthographic, view::look_at_mat4};
+use image::RgbaImage;
 use wgpu::util::DeviceExt;
 
 use crate::relief::{CELL, Heightmap};
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
+/// The block is drawn into its own image, which egui then shows: egui expects colours
+/// as displayed (not sRGB-aware), and its own pass has no depth buffer.
+const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// Layer images stacked on the surface, mirrored in terrain.wgsl.
+pub const SLOTS: usize = 6;
 
 // Vertex kinds and wall sides, mirrored in terrain.wgsl.
 const SURFACE: u8 = 0;
@@ -35,13 +43,24 @@ struct Uniforms {
     params: [f32; 4],
     grid: [f32; 4],
     sun: [f32; 4],
+    /// Opacity of each layer slot, bottom first; 0 for empty slots.
+    opacity: [[f32; 4]; 2],
 }
 
 /// GPU objects for the current block, kept in egui's callback resources.
 struct Gpu {
     pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
+    heights: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    /// Transparent 1 × 1 image for empty slots.
+    blank: wgpu::TextureView,
+    /// Draped layer images by layer id.
+    layers: HashMap<String, wgpu::TextureView>,
+    /// Layer ids in the slots, bottom first.
+    slots: Vec<String>,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
@@ -65,6 +84,49 @@ pub struct View3d {
     range: (f32, f32),
     /// Last on-screen aspect ratio, reused by the export.
     aspect: f32,
+    /// Opacity of each layer slot, bottom first.
+    opacity: [f32; SLOTS],
+    /// The on-screen image and its egui id, remade when the view changes size.
+    screen: Option<(Arc<Target>, egui::TextureId)>,
+}
+
+/// An image the block is drawn into, with its depth buffer.
+struct Target {
+    texture: wgpu::Texture,
+    color: wgpu::TextureView,
+    depth: wgpu::TextureView,
+}
+
+impl Target {
+    fn new(device: &wgpu::Device, [width, height]: [u32; 2], usage: wgpu::TextureUsages) -> Self {
+        let texture = |format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("bloc"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let color = texture(COLOR_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | usage);
+        let depth = texture(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        Self {
+            color: color.create_view(&Default::default()),
+            depth: depth.create_view(&Default::default()),
+            texture: color,
+        }
+    }
+
+    fn size(&self) -> [u32; 2] {
+        [self.texture.width(), self.texture.height()]
+    }
 }
 
 /// Gizmo axes: label, world direction (x east, y up, z south), and the view it selects.
@@ -95,10 +157,44 @@ impl View3d {
             points: (map.nx as u32, map.ny as u32),
             range: map.range(),
             aspect: 1.5,
+            opacity: [0.0; SLOTS],
+            screen: None,
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    /// Hands a layer's draped image to the GPU.
+    pub fn set_layer(&self, rs: &egui_wgpu::RenderState, id: &str, image: &RgbaImage) {
+        let view = image_view(rs, image);
+        let mut renderer = rs.renderer.write();
+        if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() {
+            gpu.layers.insert(id.to_owned(), view);
+            gpu.slots.clear(); // rebound by the next `set_stack`
+        }
+    }
+
+    /// The visible layers, bottom first, with their opacity. Layers whose image is not
+    /// ready yet are skipped; a new order rebinds the images, opacity is just a uniform.
+    pub fn set_stack(&mut self, rs: &egui_wgpu::RenderState, stack: &[(&str, f32)]) {
+        let mut renderer = rs.renderer.write();
+        let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() else {
+            return;
+        };
+        let shown: Vec<_> = stack
+            .iter()
+            .filter(|(id, _)| gpu.layers.contains_key(*id))
+            .take(SLOTS)
+            .collect();
+        let ids: Vec<String> = shown.iter().map(|(id, _)| id.to_string()).collect();
+        if ids != gpu.slots {
+            gpu.bind(&rs.device, ids);
+        }
+        self.opacity = [0.0; SLOTS];
+        for (slot, (_, opacity)) in shown.iter().enumerate() {
+            self.opacity[slot] = *opacity;
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
         self.aspect = rect.aspect_ratio();
@@ -124,12 +220,51 @@ impl View3d {
             }
         }
 
+        // Draw the block into its image before egui's pass, then show that image.
+        let size = (rect.size() * ui.pixels_per_point()).round();
+        let size = [size.x.max(1.0) as u32, size.y.max(1.0) as u32];
+        let target = self.screen_target(rs, size);
         let callback = Draw {
             uniforms: self.uniforms(self.aspect),
+            target,
         };
         ui.painter()
             .add(egui_wgpu::Callback::new_paint_callback(rect, callback));
+        if let Some((_, id)) = &self.screen {
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            ui.painter().image(*id, rect, uv, egui::Color32::WHITE);
+        }
         self.gizmo(ui, rect);
+    }
+
+    /// The on-screen image at `size` pixels, made (and handed to egui) on a size change.
+    fn screen_target(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2]) -> Arc<Target> {
+        if let Some((target, _)) = &self.screen
+            && target.size() == size
+        {
+            return target.clone();
+        }
+        let target = Arc::new(Target::new(
+            &rs.device,
+            size,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        ));
+        let mut renderer = rs.renderer.write();
+        let linear = wgpu::FilterMode::Linear;
+        let id = match &self.screen {
+            Some((_, id)) => {
+                renderer.update_egui_texture_from_wgpu_texture(
+                    &rs.device,
+                    &target.color,
+                    linear,
+                    *id,
+                );
+                *id
+            }
+            None => renderer.register_native_texture(&rs.device, &target.color, linear),
+        };
+        self.screen = Some((target.clone(), id));
+        target
     }
 
     /// Blender-style axis widget in the top-right corner; clicking an axis aligns the view.
@@ -212,6 +347,15 @@ impl View3d {
                 self.range.1,
             ],
             sun: sun.extend(0.0).to_array(),
+            opacity: [
+                [
+                    self.opacity[0],
+                    self.opacity[1],
+                    self.opacity[2],
+                    self.opacity[3],
+                ],
+                [self.opacity[4], self.opacity[5], 0.0, 0.0],
+            ],
         }
     }
 
@@ -220,29 +364,7 @@ impl View3d {
     pub fn render_image(&self, rs: &egui_wgpu::RenderState, width: u32) -> (u32, u32, Vec<u8>) {
         let height = (width as f32 / self.aspect).round() as u32;
         let (device, queue) = (&rs.device, &rs.queue);
-        let extent = wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        };
-        let texture = |format, usage| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("export"),
-                size: extent,
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            })
-        };
-        // Same formats as the screen, so the pipeline is reused and colours match.
-        let color = texture(
-            rs.target_format,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        );
-        let depth = texture(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
         let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("export"),
@@ -259,34 +381,9 @@ impl View3d {
             bytemuck::bytes_of(&self.uniforms(self.aspect)),
         );
         let mut encoder = device.create_command_encoder(&Default::default());
-        {
-            let color_view = color.create_view(&Default::default());
-            let depth_view = depth.create_view(&Default::default());
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("export"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &color_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Discard,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-            gpu.draw(&mut pass);
-        }
+        gpu.render(&mut encoder, &target);
         encoder.copy_texture_to_buffer(
-            color.as_image_copy(),
+            target.texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &readback,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -295,7 +392,7 @@ impl View3d {
                     rows_per_image: None,
                 },
             },
-            extent,
+            target.texture.size(),
         );
         queue.submit([encoder.finish()]);
 
@@ -304,10 +401,6 @@ impl View3d {
         device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("rendu terminé");
-        let bgra = matches!(
-            rs.target_format,
-            wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
-        );
         let mut rgba = Vec::with_capacity((width * height * 4) as usize);
         for line in slice
             .get_mapped_range()
@@ -316,15 +409,21 @@ impl View3d {
         {
             rgba.extend_from_slice(&line[..(width * 4) as usize]);
         }
-        if bgra {
-            rgba.chunks_mut(4).for_each(|px| px.swap(0, 2));
-        }
         (width, height, rgba)
+    }
+
+    /// Gives the on-screen image back to egui, before this view is dropped.
+    pub fn release(&mut self, rs: &egui_wgpu::RenderState) {
+        if let Some((_, id)) = self.screen.take() {
+            rs.renderer.write().free_texture(&id);
+        }
     }
 }
 
+/// Draws the block into its on-screen image, before egui's pass shows it.
 struct Draw {
     uniforms: Uniforms,
+    target: Arc<Target>,
 }
 
 impl egui_wgpu::CallbackTrait for Draw {
@@ -333,11 +432,12 @@ impl egui_wgpu::CallbackTrait for Draw {
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
         _screen: &egui_wgpu::ScreenDescriptor,
-        _encoder: &mut wgpu::CommandEncoder,
+        encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         if let Some(gpu) = resources.get::<Gpu>() {
             queue.write_buffer(&gpu.uniforms, 0, bytemuck::bytes_of(&self.uniforms));
+            gpu.render(encoder, &self.target);
         }
         Vec::new()
     }
@@ -345,17 +445,68 @@ impl egui_wgpu::CallbackTrait for Draw {
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
-        pass: &mut wgpu::RenderPass<'static>,
-        resources: &egui_wgpu::CallbackResources,
+        _pass: &mut wgpu::RenderPass<'static>,
+        _resources: &egui_wgpu::CallbackResources,
     ) {
-        if let Some(gpu) = resources.get::<Gpu>() {
-            gpu.draw(pass);
-        }
+        // Already drawn in `prepare`; egui shows the image.
     }
 }
 
 impl Gpu {
-    fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    /// Binds the layers `ids` to the slots, bottom first; missing ones stay blank.
+    fn bind(&mut self, device: &wgpu::Device, ids: Vec<String>) {
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&self.heights),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&self.sampler),
+            },
+        ];
+        for slot in 0..SLOTS {
+            let view = ids.get(slot).and_then(|id| self.layers.get(id));
+            entries.push(wgpu::BindGroupEntry {
+                binding: 3 + slot as u32,
+                resource: wgpu::BindingResource::TextureView(view.unwrap_or(&self.blank)),
+            });
+        }
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &self.layout,
+            entries: &entries,
+        });
+        self.slots = ids;
+    }
+
+    /// Draws the block into `target`, on a transparent background.
+    fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("bloc"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target.color,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &target.depth,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Discard,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(0, self.vertices.slice(..));
@@ -447,47 +598,57 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         mapped_at_creation: false,
     });
 
+    // Uniforms, heights, a sampler, then one image per layer slot.
+    let mut entries = vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+            count: None,
+        },
+    ];
+    for slot in 0..SLOTS {
+        entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 3 + slot as u32,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        });
+    }
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-        ],
+        entries: &entries,
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniforms.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(
-                    &texture.create_view(&Default::default()),
-                ),
-            },
-        ],
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
     });
+    let blank = image_view(rs, &RgbaImage::new(1, 1));
 
     let shader = device.create_shader_module(wgpu::include_wgsl!("terrain.wgsl"));
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -513,7 +674,7 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             module: &shader,
             entry_point: Some("fs_main"),
             compilation_options: Default::default(),
-            targets: &[Some(rs.target_format.into())],
+            targets: &[Some(COLOR_FORMAT.into())],
         }),
         primitive: Default::default(), // no culling: walls are seen from both sides when orbiting
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -536,10 +697,25 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             usage,
         })
     };
-    Gpu {
+    // The bind group is made by `bind`; a placeholder until then.
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[],
+        }),
+        entries: &[],
+    });
+    let mut gpu = Gpu {
         pipeline,
+        layout,
         bind_group,
         uniforms,
+        heights: texture.create_view(&Default::default()),
+        sampler,
+        blank,
+        layers: HashMap::new(),
+        slots: Vec::new(),
         vertices: buffer(
             "vertices",
             bytemuck::cast_slice(&vertices),
@@ -551,5 +727,32 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             wgpu::BufferUsages::INDEX,
         ),
         index_count: indices.len() as u32,
-    }
+    };
+    gpu.bind(device, Vec::new());
+    gpu
+}
+
+/// An sRGB-coded image as a texture, sampled as is like the other colours of the shader.
+fn image_view(rs: &egui_wgpu::RenderState, image: &RgbaImage) -> wgpu::TextureView {
+    rs.device
+        .create_texture_with_data(
+            &rs.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("calque"),
+                size: wgpu::Extent3d {
+                    width: image.width(),
+                    height: image.height(),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            image.as_raw(),
+        )
+        .create_view(&Default::default())
 }
