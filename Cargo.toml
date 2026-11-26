@@ -1,0 +1,9 @@
+[package]
+name = "blocs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+eframe = "0.37"
+walkers = "0.66.0"
+wgpu = "30"
