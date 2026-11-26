@@ -7,6 +7,7 @@ mod layers;
 mod map;
 mod relief;
 mod style;
+mod sun;
 mod tiles;
 mod view3d;
 
@@ -315,7 +316,9 @@ impl Blocs {
                             if let Some(old) = &mut self.view3d {
                                 old.release(rs);
                             }
-                            self.view3d = Some(View3d::new(rs, &map));
+                            let (x, y) = ((built.x0 + built.x1) / 2.0, (built.y0 + built.y1) / 2.0);
+                            let latitude = lambert93::to_wgs84(x, y).1;
+                            self.view3d = Some(View3d::new(rs, &map, latitude));
                             // The new block starts without layer images.
                             self.draped.clear();
                             self.draping.clear();
@@ -751,7 +754,7 @@ impl Blocs {
         ui.label("Profondeur du socle");
         ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=2000.0).suffix(" m"));
         ui.separator();
-        ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas");
+        ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil");
         ui.separator();
         ui.label("Image PNG (fond transparent)");
         egui::ComboBox::from_id_salt("largeur")

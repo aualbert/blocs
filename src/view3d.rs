@@ -15,6 +15,7 @@ use wgpu::util::DeviceExt;
 
 use crate::buildings;
 use crate::relief::{CELL, Heightmap};
+use crate::sun::Sun;
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// The block is drawn into its own image, which egui then shows: egui expects colours
@@ -92,6 +93,7 @@ pub struct View3d {
     aspect: f32,
     /// Opacity of each layer slot, bottom first.
     opacity: [f32; SLOTS],
+    sun: Sun,
     /// The on-screen image and its egui id, remade when the view changes size.
     screen: Option<(Arc<Target>, egui::TextureId)>,
 }
@@ -150,8 +152,8 @@ const AXES: [(&str, [f32; 3], f32, f32); 6] = [
 ];
 
 impl View3d {
-    /// Uploads the block to the GPU, replacing the previous one.
-    pub fn new(render_state: &egui_wgpu::RenderState, map: &Heightmap) -> Self {
+    /// Uploads the block to the GPU, replacing the previous one; `latitude` in degrees.
+    pub fn new(render_state: &egui_wgpu::RenderState, map: &Heightmap, latitude: f64) -> Self {
         let gpu = upload(render_state, map);
         render_state.renderer.write().callback_resources.insert(gpu);
         let cell = CELL as f32;
@@ -168,6 +170,11 @@ impl View3d {
             range: map.range(),
             aspect: 1.5,
             opacity: [0.0; SLOTS],
+            // Afternoon sun from the south-west.
+            sun: Sun::new(
+                (latitude as f32).to_radians(),
+                Vec3::new(-0.5, 0.6, 0.6).normalize(),
+            ),
             screen: None,
         }
     }
@@ -305,15 +312,36 @@ impl View3d {
         target
     }
 
-    /// Blender-style axis widget in the top-right corner; clicking an axis aligns the view.
+    /// Blender-style axis widget in the top-right corner: clicking an axis aligns the view,
+    /// dragging the widget turns it.
+    /// The sun sits among the axes at its true direction, over its day's course; dragging it
+    /// moves it where the real sun goes.
     fn gizmo(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let (dir, right, up) = self.basis();
         let radius = 40.0;
         let center = rect.right_top() + egui::vec2(-radius - 16.0, radius + 16.0);
         let area = egui::Rect::from_center_size(center, egui::Vec2::splat(2.0 * radius + 24.0));
-        let response = ui.interact(area, ui.scope_id().with("gizmo"), egui::Sense::click());
+        let response = ui.interact(
+            area,
+            ui.scope_id().with("gizmo"),
+            egui::Sense::click_and_drag(),
+        );
         let painter = ui.painter_at(area);
         painter.circle_filled(center, radius + 12.0, egui::Color32::from_black_alpha(40));
+
+        let to_widget = |d: Vec3| center + radius * egui::vec2(d.dot(right), -d.dot(up));
+        let path = self.sun.path().into_iter().map(to_widget).collect();
+        let faint = egui::Color32::from_rgba_unmultiplied(250, 200, 40, 120);
+        painter.line(path, egui::Stroke::new(2.0, faint));
+        let sun = self.sun.dir();
+        let sun_pos = to_widget(sun);
+        let draw_sun = || {
+            let rim = egui::Stroke::new(1.5, egui::Color32::from_rgb(200, 120, 20));
+            painter.circle(sun_pos, 7.0, egui::Color32::from_rgb(250, 200, 40), rim);
+        };
+        if sun.dot(dir) < 0.0 {
+            draw_sun(); // behind the axes
+        }
 
         // Draw back to front so the nearest axis is on top and gets the click.
         let mut axes: Vec<_> = AXES
@@ -352,6 +380,33 @@ impl View3d {
         if let Some(&(_, _, yaw, pitch)) = clicked {
             (self.yaw, self.pitch) = (yaw, pitch);
         }
+        // The axes follow the pointer: one widget radius of drag is one radian.
+        if response.dragged() {
+            let d = response.drag_delta() / radius;
+            self.yaw -= d.x;
+            self.pitch = (self.pitch + d.y).clamp(-FRAC_PI_2, FRAC_PI_2);
+        }
+
+        if sun.dot(dir) >= 0.0 {
+            draw_sun();
+        }
+        let response = ui
+            .interact(
+                egui::Rect::from_center_size(sun_pos, egui::Vec2::splat(18.0)),
+                ui.scope_id().with("soleil"),
+                egui::Sense::drag(),
+            )
+            .on_hover_text(format!("Soleil à {} (heure solaire)", self.sun.describe()));
+        if response.dragged()
+            && let Some(p) = response.interact_pointer_pos()
+        {
+            // The pointer on the widget's sphere, on the sun's side of it (front or back).
+            let v = (p - center) / radius;
+            let (x, y) = (v.x, -v.y);
+            let z = (1.0 - x * x - y * y).max(0.0).sqrt().copysign(sun.dot(dir));
+            let d = (x * right + y * up + z * dir).normalize();
+            self.sun.snap(d);
+        }
     }
 
     /// Unit vectors towards the viewer, to the right and up on screen.
@@ -373,8 +428,7 @@ impl View3d {
         let view = look_at_mat4(target + dir * radius * 2.0, target, up);
         let (h, w) = (self.zoom, self.zoom * aspect);
         let proj = orthographic(-w, w, -h, h, 0.0, radius * 4.0);
-        // Fixed afternoon sun from the south-west for now.
-        let sun = Vec3::new(-0.5, 0.6, 0.6).normalize();
+        let sun = self.sun.dir();
         Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
             params: [self.exaggeration, self.base_depth, CELL as f32, 0.0],
@@ -420,7 +474,12 @@ impl View3d {
         queue.submit([encoder.finish()]);
         let mut rgba = read_texture(device, queue, &target.texture);
         // Antialiased edges come out premultiplied; PNG wants straight alpha.
-        for px in rgba.as_chunks_mut::<4>().0.iter_mut().filter(|px| px[3] > 0) {
+        for px in rgba
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .filter(|px| px[3] > 0)
+        {
             for c in 0..3 {
                 px[c] = (px[c] as u32 * 255 / px[3] as u32) as u8;
             }
