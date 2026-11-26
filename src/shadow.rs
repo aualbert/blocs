@@ -19,7 +19,7 @@ pub fn size(nx: usize, ny: usize) -> (usize, usize) {
 /// In between on a shadow's edge.
 /// `heights` are rows south → north of `nx` points; `sun` points towards the sun
 /// (x east, y up, z south).
-pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3, exaggeration: f32) -> Vec<u8> {
+pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3) -> Vec<u8> {
     let (mx, my) = size(nx, ny);
     let flat = sun.x.hypot(sun.z);
     if sun.y <= 0.0 {
@@ -45,8 +45,7 @@ pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3, exaggeration: f32)
     };
     let slope = db / da.abs();
     // How much lower the shadow line is one step further from the sun, in true metres.
-    let drop =
-        (STEP as f64 * CELL) as f32 * (1.0 + slope * slope).sqrt() * sun.y / flat / exaggeration;
+    let drop = (STEP as f64 * CELL) as f32 * (1.0 + slope * slope).sqrt() * sun.y / flat;
 
     // Height of the shadow line over each point of the previous line; none before the first.
     let mut prev = vec![f32::NEG_INFINITY; nb];
@@ -93,7 +92,7 @@ mod tests {
         for j in 0..ny {
             h[j * nx + 2] = 100.0;
         }
-        let lit = mask(&h, nx, ny, Vec3::new(-1.0, 1.0, 0.0).normalize(), 1.0);
+        let lit = mask(&h, nx, ny, Vec3::new(-1.0, 1.0, 0.0).normalize());
         // The shadow reaches 100 m east of the wall, no further; mask points are 10 m apart.
         let mx = size(nx, ny).0;
         assert_eq!(lit[mx], 255);

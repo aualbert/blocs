@@ -97,9 +97,10 @@ pub struct View3d {
     /// Opacity of each layer slot, bottom first.
     opacity: [f32; SLOTS],
     sun: Sun,
-    /// The block's heights, and the sun and exaggeration its shadows were cast for.
+    /// The block's heights, and the sun its shadows were cast for: on the true relief,
+    /// so that stretching it leaves them alone.
     heights: Vec<f32>,
-    shadows_for: Option<(Vec3, f32)>,
+    shadows_for: Option<Vec3>,
     /// The on-screen image and its egui id, remade when the view changes size.
     screen: Option<(Arc<Target>, egui::TextureId)>,
 }
@@ -187,15 +188,15 @@ impl View3d {
         }
     }
 
-    /// Casts the relief's shadows again if the sun or the exaggeration changed.
+    /// Casts the relief's shadows again if the sun moved.
     fn update_shadows(&mut self, rs: &egui_wgpu::RenderState) {
-        let key = (self.sun.dir(), self.exaggeration);
-        if self.shadows_for == Some(key) {
+        let sun = self.sun.dir();
+        if self.shadows_for == Some(sun) {
             return;
         }
-        self.shadows_for = Some(key);
+        self.shadows_for = Some(sun);
         let (nx, ny) = (self.points.0 as usize, self.points.1 as usize);
-        let mask = shadow::mask(&self.heights, nx, ny, key.0, key.1);
+        let mask = shadow::mask(&self.heights, nx, ny, sun);
         let renderer = rs.renderer.read();
         if let Some(gpu) = renderer.callback_resources.get::<Gpu>() {
             let mx = shadow::size(nx, ny).0;
