@@ -7,11 +7,32 @@
 
 use std::sync::OnceLock;
 
+use eframe::egui;
 use serde_json::{Value, json};
 use walkers::Style;
 
 /// Name of the style's source, which the Plan IGN tiles are given under.
 pub const SOURCE: &str = "plan_ign";
+
+/// Source Sans 3 (SIL Open Font License, assets/fonts/OFL.md), the Plan IGN's font.
+pub const FONT: &[u8] = include_bytes!("../assets/fonts/SourceSans3-Regular.ttf");
+/// Widest text halo kept: walkers draws a halo as 8 copies of the text this far away,
+/// which show as ghost letters beyond about 2 points.
+const MAX_HALO: f64 = 2.0;
+
+/// Makes Source Sans the proportional font of `ctx`: map labels (walkers draws them all
+/// in it) and the interface.
+pub fn install_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "source-sans".into(),
+        std::sync::Arc::new(egui::FontData::from_static(FONT)),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "source-sans".into());
+    }
+    ctx.set_fonts(fonts);
+}
 
 /// Groups of style rules, by the tile data they draw.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -101,6 +122,15 @@ fn full() -> &'static Value {
             // walkers 0.66 reads `source_layer` on circle layers (a missing kebab-case rename).
             if layer["type"] == "circle" {
                 layer["source_layer"] = layer["source-layer"].clone();
+            }
+            let paint = &mut layer["paint"];
+            if let Some(width) = paint["text-halo-width"].as_f64() {
+                paint["text-halo-width"] = json!(width.min(MAX_HALO));
+            }
+            // Road numbers sit on shields, icons walkers cannot draw: the shield's colour
+            // becomes an opaque halo, so the light text stays readable.
+            if layer["layout"].get("icon-text-fit").is_some() {
+                layer["paint"]["text-halo-color"] = layer["paint"]["icon-color"].clone();
             }
         }
         modernise(&mut json);

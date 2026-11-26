@@ -36,7 +36,7 @@ pub fn save_png(
 
 /// Dark grey text, scaled with the image, blended over what is already there.
 fn draw_text(rgba: &mut [u8], width: u32, height: u32, text: &str) {
-    let font = FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("police egui");
+    let font = FontRef::try_from_slice(crate::style::FONT).expect("police Source Sans");
     let scaled = font.as_scaled(PxScale::from((width as f32 / 90.0).max(12.0)));
     let margin = scaled.height();
     let text_width: f32 = text

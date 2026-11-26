@@ -152,6 +152,7 @@ impl Blocs {
         std::thread::spawn(tiles::trim_cache);
         // walkers draws vector tiles with its own wgpu pipeline.
         walkers::install_renderer(cc.wgpu_render_state.as_ref());
+        style::install_font(&cc.egui_ctx);
         // The Plan IGN categories, top first, all drawn from one download; the photo below.
         let ctx = cc.egui_ctx.clone();
         let plan = Store::new("planign", Source::PlanIgn);
@@ -922,7 +923,10 @@ fn load_block(frame: &Frame) -> relief::Result<(Heightmap, String)> {
 /// `blocs installer D038`, `blocs convertir <archive.7z> D038`, `blocs bloc <lon> <lat>`.
 fn main() -> eframe::Result {
     // Library warnings and errors (file dialog, GPU…) in the terminal; RUST_LOG for more.
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    // Known, harmless: walkers warns on every tile about style features it skips (circles,
+    // long dashes); arboard on GNOME about its clipboard fallback.
+    let filter = env_logger::Env::default().default_filter_or("warn,walkers=error,arboard=error");
+    env_logger::Builder::from_env(filter).init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["bloc", lon, lat] => {

@@ -180,6 +180,7 @@ fn render_map(
     rs: &egui_wgpu::RenderState,
 ) -> Result<RgbaImage> {
     let ctx = egui::Context::default();
+    crate::style::install_font(&ctx);
     let points = vec2(size[0] as f32, size[1] as f32) / ppp;
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), points)),

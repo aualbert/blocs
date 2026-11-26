@@ -557,7 +557,6 @@ dependencies = [
  "earcut",
  "eframe",
  "env_logger",
- "epaint_default_fonts",
  "glam",
  "image",
  "mvt-reader",
