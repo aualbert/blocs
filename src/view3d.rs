@@ -21,6 +21,8 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Layer images stacked on the surface, mirrored in terrain.wgsl.
 pub const SLOTS: usize = 8;
+/// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
+const SAMPLES: u32 = 4;
 
 // Vertex kinds and wall sides, mirrored in terrain.wgsl.
 const SURFACE: u8 = 0;
@@ -90,16 +92,17 @@ pub struct View3d {
     screen: Option<(Arc<Target>, egui::TextureId)>,
 }
 
-/// An image the block is drawn into, with its depth buffer.
+/// An image the block is drawn into, with its multisampled colour and depth buffers.
 struct Target {
     texture: wgpu::Texture,
     color: wgpu::TextureView,
+    msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
 }
 
 impl Target {
     fn new(device: &wgpu::Device, [width, height]: [u32; 2], usage: wgpu::TextureUsages) -> Self {
-        let texture = |format, usage| {
+        let texture = |format, usage, sample_count| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("bloc"),
                 size: wgpu::Extent3d {
@@ -108,17 +111,20 @@ impl Target {
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
-                sample_count: 1,
+                sample_count,
                 dimension: wgpu::TextureDimension::D2,
                 format,
                 usage,
                 view_formats: &[],
             })
         };
-        let color = texture(COLOR_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT | usage);
-        let depth = texture(DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let attachment = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        let color = texture(COLOR_FORMAT, attachment | usage, 1);
+        let msaa = texture(COLOR_FORMAT, attachment, SAMPLES);
+        let depth = texture(DEPTH_FORMAT, attachment, SAMPLES);
         Self {
             color: color.create_view(&Default::default()),
+            msaa: msaa.create_view(&Default::default()),
             depth: depth.create_view(&Default::default()),
             texture: color,
         }
@@ -380,7 +386,14 @@ impl View3d {
         let mut encoder = device.create_command_encoder(&Default::default());
         gpu.render(&mut encoder, &target);
         queue.submit([encoder.finish()]);
-        (width, height, read_texture(device, queue, &target.texture))
+        let mut rgba = read_texture(device, queue, &target.texture);
+        // Antialiased edges come out premultiplied; PNG wants straight alpha.
+        for px in rgba.chunks_exact_mut(4).filter(|px| px[3] > 0) {
+            for c in 0..3 {
+                px[c] = (px[c] as u32 * 255 / px[3] as u32) as u8;
+            }
+        }
+        (width, height, rgba)
     }
 
     /// Gives the on-screen image back to egui, before this view is dropped.
@@ -455,17 +468,18 @@ impl Gpu {
         self.slots = ids;
     }
 
-    /// Draws the block into `target`, on a transparent background.
+    /// Draws the block into `target`, on a transparent background, resolving the samples
+    /// into a premultiplied image.
     fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("bloc"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target.color,
+                view: &target.msaa,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target: Some(&target.color),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
+                    store: wgpu::StoreOp::Discard,
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -658,7 +672,10 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             stencil: Default::default(),
             bias: Default::default(),
         }),
-        multisample: Default::default(),
+        multisample: wgpu::MultisampleState {
+            count: SAMPLES,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     });
