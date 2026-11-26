@@ -29,6 +29,10 @@ use view3d::View3d;
 /// Map centre at start-up.
 const START: (f64, f64) = (2.35, 46.6);
 /// Export widths offered, in pixels.
+/// Glide after a drag pan, gentler than walkers' own (2× the pointer speed, 0.2 s):
+/// starting speed as a share of the pointer's, and decay time (s).
+const GLIDE_SPEED: f32 = 1.0;
+const GLIDE_TAU: f32 = 0.12;
 const EXPORT_WIDTHS: [u32; 3] = [1280, 1920, 3840];
 
 /// Messages from background work to the UI.
@@ -99,6 +103,8 @@ struct Blocs {
     background: walkers::StyledSources,
     plan: Store,
     map_memory: MapMemory,
+    /// Map speed after a drag pan, in points per second.
+    glide: egui::Vec2,
     frame: Option<Frame>,
     edit: Option<Edit>,
     drawing: bool,
@@ -174,6 +180,7 @@ impl Blocs {
             background,
             plan,
             map_memory,
+            glide: egui::Vec2::ZERO,
             frame: None,
             edit: None,
             drawing: false,
@@ -804,7 +811,21 @@ impl eframe::App for Blocs {
                 MapTiles::Styled(styled) => map.with_layer(styled, opacity),
             };
         }
-        ui.add(map);
+        let response = ui.add(map);
+
+        // Replace walkers' glide on release, which carries the map too far, with ours.
+        let (velocity, dt) = ui.input(|i| (i.pointer.velocity(), i.stable_dt));
+        if pan && response.dragged_by(egui::PointerButton::Primary) {
+            self.glide = velocity * GLIDE_SPEED;
+        } else if response.drag_stopped() {
+            if let Some(center) = self.map_memory.detached() {
+                self.map_memory.center_at(center);
+            }
+        } else if self.glide.length() > 10.0 {
+            map::pan(&mut self.map_memory, lon_lat(START.0, START.1), self.glide * dt);
+            self.glide *= (-dt / GLIDE_TAU).exp();
+            ui.ctx().request_repaint();
+        }
     }
 }
 
