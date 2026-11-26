@@ -91,6 +91,37 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
     return out;
 }
 
+// Building corners, see buildings.rs: true heights over the exaggerated ground.
+@vertex
+fn vs_building(
+    @location(0) grid: vec2<f32>,
+    @location(1) ground: f32,
+    @location(2) roof: f32,
+    @location(3) normal: vec2<f32>,
+) -> Out {
+    let exag = u.params.x;
+    let half = (u.grid.xy - 1.0) * 0.5;
+    var y = (ground - u.grid.z) * exag + roof;
+    if roof == 0.0 {
+        // A wall's foot goes down to the lowest terrain point around it.
+        let i = i32(floor(grid.x));
+        let j = i32(floor(grid.y));
+        let t = min(min(height(i, j), height(i + 1, j)), min(height(i, j + 1), height(i + 1, j + 1)));
+        y = (min(t, ground) - u.grid.z) * exag;
+    }
+    let p = vec3((grid.x - half.x) * u.params.z, y, (half.y - grid.y) * u.params.z);
+
+    var out: Out;
+    out.pos = u.view_proj * vec4(p, 1.0);
+    out.uv = vec2(grid.x, u.grid.y - 1.0 - grid.y) / (u.grid.xy - 1.0);
+    // Roofs face up, walls face out (north being -z); all plain light grey.
+    let is_roof = all(normal == vec2(0.0));
+    out.normal = select(vec3(normal.x, 0.0, -normal.y), vec3(0.0, 1.0, 0.0), is_roof);
+    out.color = vec3(0.88);
+    out.surface = 0.0;
+    return out;
+}
+
 // Lays one layer (premultiplied alpha) over the colour below, as the map does.
 fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
     return below * (1.0 - layer.a * opacity) + layer.rgb * opacity;

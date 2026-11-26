@@ -86,6 +86,11 @@ impl PlanIgn {
         })
     }
 
+    /// The 3D buildings of the frame, from the same tiles as the draped Plan IGN.
+    pub fn buildings(&self) -> crate::buildings::Mesh {
+        crate::buildings::mesh(self.zoom - 1, &self.tiles, &self.frame)
+    }
+
     /// The Plan IGN drawn with `style` over the frame, rows north to south, premultiplied.
     pub fn draw(&self, style: &Style, rs: &egui_wgpu::RenderState) -> Result<RgbaImage> {
         // Styled as walkers styles them for the map.
@@ -383,7 +388,7 @@ fn to_mercator(lon: f64, lat: f64) -> (f64, f64) {
 }
 
 /// Web Mercator world units → degrees.
-fn from_mercator(x: f64, y: f64) -> (f64, f64) {
+pub fn from_mercator(x: f64, y: f64) -> (f64, f64) {
     (
         x * 360.0 - 180.0,
         (PI * (1.0 - 2.0 * y)).sinh().atan().to_degrees(),

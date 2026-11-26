@@ -13,6 +13,7 @@ use glam::camera::rh::{proj::directx::orthographic, view::look_at_mat4};
 use image::RgbaImage;
 use wgpu::util::DeviceExt;
 
+use crate::buildings;
 use crate::relief::{CELL, Heightmap};
 
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
@@ -66,6 +67,9 @@ struct Gpu {
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
+    /// Buildings pipeline, and their vertices, indices and index count once known.
+    building_pipeline: wgpu::RenderPipeline,
+    buildings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
 }
 
 /// Axonometric camera orbiting the block, and display settings.
@@ -175,6 +179,34 @@ impl View3d {
         if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() {
             gpu.layers.insert(id.to_owned(), view);
             gpu.slots.clear(); // rebound by the next `set_stack`
+        }
+    }
+
+    /// Hands the block's buildings to the GPU.
+    pub fn set_buildings(&self, rs: &egui_wgpu::RenderState, mesh: &buildings::Mesh) {
+        let mut renderer = rs.renderer.write();
+        if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>()
+            && !mesh.indices.is_empty()
+        {
+            let buffer = |contents: &[u8], usage| {
+                rs.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("bâtiments"),
+                        contents,
+                        usage,
+                    })
+            };
+            gpu.buildings = Some((
+                buffer(
+                    bytemuck::cast_slice(&mesh.vertices),
+                    wgpu::BufferUsages::VERTEX,
+                ),
+                buffer(
+                    bytemuck::cast_slice(&mesh.indices),
+                    wgpu::BufferUsages::INDEX,
+                ),
+                mesh.indices.len() as u32,
+            ));
         }
     }
 
@@ -388,7 +420,7 @@ impl View3d {
         queue.submit([encoder.finish()]);
         let mut rgba = read_texture(device, queue, &target.texture);
         // Antialiased edges come out premultiplied; PNG wants straight alpha.
-        for px in rgba.chunks_exact_mut(4).filter(|px| px[3] > 0) {
+        for px in rgba.as_chunks_mut::<4>().0.iter_mut().filter(|px| px[3] > 0) {
             for c in 0..3 {
                 px[c] = (px[c] as u32 * 255 / px[3] as u32) as u8;
             }
@@ -497,6 +529,12 @@ impl Gpu {
         pass.set_vertex_buffer(0, self.vertices.slice(..));
         pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
         pass.draw_indexed(0..self.index_count, 0, 0..1);
+        if let Some((vertices, indices, count)) = &self.buildings {
+            pass.set_pipeline(&self.building_pipeline);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..*count, 0, 0..1);
+        }
     }
 }
 
@@ -639,46 +677,60 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
     let blank = image_view(rs, &[RgbaImage::new(1, 1)]);
 
     let shader = device.create_shader_module(wgpu::include_wgsl!("terrain.wgsl"));
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("terrain"),
-        layout: Some(
-            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            }),
-        ),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[Some(wgpu::VertexBufferLayout {
-                array_stride: size_of::<Vertex>() as u64,
-                step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Uint16x2, 1 => Uint8x2],
-            })],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs_main"),
-            compilation_options: Default::default(),
-            targets: &[Some(COLOR_FORMAT.into())],
-        }),
-        primitive: Default::default(), // no culling: walls are seen from both sides when orbiting
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: DEPTH_FORMAT,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(wgpu::CompareFunction::Less),
-            stencil: Default::default(),
-            bias: Default::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: SAMPLES,
-            ..Default::default()
-        },
-        multiview_mask: None,
-        cache: None,
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
+    // Terrain and buildings differ only by their vertices.
+    let pipeline = |entry, buffer: wgpu::VertexBufferLayout| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: Default::default(),
+                buffers: &[Some(buffer)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(COLOR_FORMAT.into())],
+            }),
+            primitive: Default::default(), // no culling: walls are seen from both sides when orbiting
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: SAMPLES,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let building_pipeline = pipeline(
+        "vs_building",
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<buildings::Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32, 3 => Float32x2],
+        },
+    );
+    let pipeline = pipeline(
+        "vs_main",
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Uint16x2, 1 => Uint8x2],
+        },
+    );
 
     let (vertices, indices) = mesh(map.nx, map.ny);
     let buffer = |label, contents: &[u8], usage| {
@@ -718,6 +770,8 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
             wgpu::BufferUsages::INDEX,
         ),
         index_count: indices.len() as u32,
+        building_pipeline,
+        buildings: None,
     };
     gpu.bind(device, Vec::new());
     gpu

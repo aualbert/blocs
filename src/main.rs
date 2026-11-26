@@ -1,3 +1,4 @@
+mod buildings;
 mod drape;
 mod export;
 mod ign;
@@ -51,6 +52,8 @@ enum Msg {
     Built(Frame, relief::Result<(Heightmap, String)>),
     /// A layer's image over a block's frame, with its mipmaps.
     Draped(Frame, &'static str, relief::Result<Vec<image::RgbaImage>>),
+    /// The 3D buildings of a block's frame.
+    Buildings(Frame, buildings::Mesh),
 }
 
 /// One layer of the stack, with its map tiles.
@@ -67,6 +70,8 @@ struct MapLayer {
 
 /// The Plan IGN's opaque background on the block, under the stack when the photo is hidden.
 const BACKGROUND: &str = "fond";
+/// Pseudo-layer of the 3D buildings, always on, made from the Plan IGN tiles.
+const BUILDINGS: &str = "bâtiments";
 
 /// How a layer is drawn on the map.
 enum MapTiles {
@@ -290,6 +295,17 @@ impl Blocs {
                         }
                     }
                 }
+                Msg::Buildings(built, mesh) => {
+                    self.draping.remove(BUILDINGS);
+                    if let (true, Some(view), Some(rs)) = (
+                        self.built == Some(built),
+                        &self.view3d,
+                        frame.wgpu_render_state(),
+                    ) {
+                        view.set_buildings(rs, &mesh);
+                        self.draped.insert(BUILDINGS);
+                    }
+                }
                 Msg::Built(built, result) => {
                     self.building = false;
                     match result {
@@ -449,6 +465,7 @@ impl Blocs {
         let wanted: Vec<_> = (self.layers.iter().filter(|l| l.visible))
             .map(|l| (l.id, l.category))
             .chain(background)
+            .chain([(BUILDINGS, None)])
             .filter(|(id, _)| !self.draped.contains(id) && !self.draping.contains(id))
             .collect();
         let mut plan = Vec::new();
@@ -477,6 +494,10 @@ impl Blocs {
         self.spawn(move |send| match drape::PlanIgn::fetch(&store, &frame) {
             Ok(tiles) => {
                 for (id, category) in plan {
+                    if id == BUILDINGS {
+                        send(Msg::Buildings(frame, tiles.buildings()));
+                        continue;
+                    }
                     let image = tiles.draw(&style::plan_ign(category), &rs);
                     let image = image.map(view3d::mipmaps);
                     send(Msg::Draped(frame, id, image));
@@ -714,7 +735,7 @@ impl Blocs {
         if !self.draping.is_empty() {
             let names: Vec<_> = (self.layers.iter())
                 .map(|l| (l.id, l.name))
-                .chain([(BACKGROUND, "Fond du Plan IGN")])
+                .chain([(BACKGROUND, "Fond du Plan IGN"), (BUILDINGS, "Bâtiments")])
                 .filter(|(id, _)| self.draping.contains(id))
                 .map(|(_, name)| name)
                 .collect();
@@ -822,7 +843,11 @@ impl eframe::App for Blocs {
                 self.map_memory.center_at(center);
             }
         } else if self.glide.length() > 10.0 {
-            map::pan(&mut self.map_memory, lon_lat(START.0, START.1), self.glide * dt);
+            map::pan(
+                &mut self.map_memory,
+                lon_lat(START.0, START.1),
+                self.glide * dt,
+            );
             self.glide *= (-dt / GLIDE_TAU).exp();
             ui.ctx().request_repaint();
         }
