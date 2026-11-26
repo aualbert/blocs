@@ -40,6 +40,9 @@ struct Out {
     @location(3) surface: f32,
     // Position in metres, x east, y up, z south: for the shadows.
     @location(4) world: vec3<f32>,
+    // 1 where the relief's shadows fall (surface, buildings); 0 on the block's walls
+    // and floor, whose sunny sides face away from the relief.
+    @location(5) shaded: f32,
 };
 
 fn height(i: i32, j: i32) -> f32 {
@@ -78,6 +81,7 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
             out.normal = normalize(vec3(-dx, 1.0, -dz));
             out.color = tint(h);
             out.surface = 1.0;
+            out.shaded = 1.0;
         }
         case FLOOR: {
             p.y = -u.params.y;
@@ -126,6 +130,7 @@ fn vs_building(
     out.normal = select(vec3(normal.x, 0.0, -normal.y), vec3(0.0, 1.0, 0.0), is_roof);
     out.color = vec3(0.88);
     out.surface = 0.0;
+    out.shaded = 1.0;
     return out;
 }
 
@@ -163,7 +168,7 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     let color = mix(in.color, c, in.surface);
 
     // The 3D light shades the layers; none of them carries baked shading.
-    let direct = max(dot(normalize(in.normal), u.sun.xyz), 0.0) * sunlit(in.world);
+    let direct = max(dot(normalize(in.normal), u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
     let light = 0.35 + 0.65 * direct;
     return vec4(color * light, 1.0);
 }
