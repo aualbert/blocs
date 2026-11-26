@@ -549,6 +549,7 @@ dependencies = [
  "epaint_default_fonts",
  "glam",
  "image",
+ "pollster",
  "reqwest",
  "rfd",
  "serde_json",

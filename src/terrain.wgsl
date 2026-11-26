@@ -5,7 +5,7 @@ struct Uniforms {
     params: vec4<f32>, // exaggeration, base depth (m), cell (m), unused
     grid: vec4<f32>,   // points east, points north, min height, max height (m)
     sun: vec4<f32>,    // direction towards the sun
-    opacity: array<vec4<f32>, 2>, // per layer slot, bottom first
+    opacity: array<vec4<f32>, 2>, // per layer slot (SLOTS), bottom first
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -18,6 +18,8 @@ struct Uniforms {
 @group(0) @binding(6) var layer3: texture_2d<f32>;
 @group(0) @binding(7) var layer4: texture_2d<f32>;
 @group(0) @binding(8) var layer5: texture_2d<f32>;
+@group(0) @binding(9) var layer6: texture_2d<f32>;
+@group(0) @binding(10) var layer7: texture_2d<f32>;
 
 // Vertex kinds, see view3d.rs.
 const SURFACE: u32 = 0u;
@@ -89,9 +91,9 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
     return out;
 }
 
-// Lays one layer over the colour below, as the map does.
+// Lays one layer (premultiplied alpha) over the colour below, as the map does.
 fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
-    return mix(below, layer.rgb, layer.a * opacity);
+    return below * (1.0 - layer.a * opacity) + layer.rgb * opacity;
 }
 
 @fragment
@@ -104,6 +106,8 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     c = over(c, textureSample(layer3, samp, in.uv), u.opacity[0].w);
     c = over(c, textureSample(layer4, samp, in.uv), u.opacity[1].x);
     c = over(c, textureSample(layer5, samp, in.uv), u.opacity[1].y);
+    c = over(c, textureSample(layer6, samp, in.uv), u.opacity[1].z);
+    c = over(c, textureSample(layer7, samp, in.uv), u.opacity[1].w);
     let color = mix(in.color, c, in.surface);
 
     // The 3D light shades the layers; none of them carries baked shading.

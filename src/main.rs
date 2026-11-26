@@ -56,8 +56,13 @@ struct MapLayer {
     visible: bool,
     opacity: f32,
     store: Store,
+    /// The Plan IGN category drawn; `None` for the photo.
+    category: Option<Category>,
     tiles: MapTiles,
 }
+
+/// The Plan IGN's opaque background on the block, under the stack when the photo is hidden.
+const BACKGROUND: &str = "fond";
 
 /// How a layer is drawn on the map.
 enum MapTiles {
@@ -92,6 +97,7 @@ struct Blocs {
     layers: Vec<MapLayer>,
     /// The Plan IGN's opaque background, drawn when the photo is not.
     background: walkers::StyledSources,
+    plan: Store,
     map_memory: MapMemory,
     frame: Option<Frame>,
     edit: Option<Edit>,
@@ -144,6 +150,7 @@ impl Blocs {
                 visible: true,
                 opacity: 1.0,
                 store: plan.clone(),
+                category: Some(c),
                 tiles: MapTiles::Styled(styled(Some(c))),
             })
             .collect();
@@ -155,6 +162,7 @@ impl Blocs {
             opacity: 1.0,
             tiles: MapTiles::Images(TileLayer::new(ctx.clone(), photo.clone())),
             store: photo,
+            category: None,
         });
         let background = styled(None);
         Self {
@@ -164,6 +172,7 @@ impl Blocs {
             status: String::new(),
             layers,
             background,
+            plan,
             map_memory,
             frame: None,
             edit: None,
@@ -423,25 +432,65 @@ impl Blocs {
         }
     }
 
-    /// Prepares the block image of each visible layer that has none yet.
-    fn drape_visible(&mut self) {
-        let Some(frame) = self.built else { return };
-        // Only image layers for now: the Plan IGN needs off-screen rendering, still to come.
-        let jobs: Vec<_> = (self.layers.iter())
-            .filter(|l| matches!(*l.store.source, Source::Image { .. }))
-            .filter(|l| l.visible && !self.draped.contains(l.id) && !self.draping.contains(l.id))
-            .map(|l| (l.id, l.store.clone()))
+    /// Prepares the block image of each visible layer that has none yet. The Plan IGN
+    /// categories share one job, which fetches their tiles once.
+    fn drape_visible(&mut self, rs: Option<&eframe::egui_wgpu::RenderState>) {
+        let (Some(frame), Some(rs)) = (self.built, rs) else {
+            return;
+        };
+        let background = (!self.photo_visible()).then_some((BACKGROUND, None));
+        let wanted: Vec<_> = (self.layers.iter().filter(|l| l.visible))
+            .map(|l| (l.id, l.category))
+            .chain(background)
+            .filter(|(id, _)| !self.draped.contains(id) && !self.draping.contains(id))
             .collect();
-        for (id, store) in jobs {
+        let mut plan = Vec::new();
+        for (id, category) in wanted {
             self.draping.insert(id);
-            self.spawn(move |send| send(Msg::Draped(frame, id, drape::drape(&store, &frame))));
+            if id == "photo" {
+                let store = self
+                    .layers
+                    .iter()
+                    .find(|l| l.id == id)
+                    .unwrap()
+                    .store
+                    .clone();
+                self.spawn(move |send| send(Msg::Draped(frame, id, drape::drape(&store, &frame))));
+            } else {
+                plan.push((id, category));
+            }
         }
+        if plan.is_empty() {
+            return;
+        }
+        let (store, rs) = (self.plan.clone(), rs.clone());
+        self.spawn(move |send| match drape::PlanIgn::fetch(&store, &frame) {
+            Ok(tiles) => {
+                for (id, category) in plan {
+                    let image = tiles.draw(&style::plan_ign(category), &rs);
+                    send(Msg::Draped(frame, id, image));
+                }
+            }
+            Err(e) => {
+                for (id, _) in plan {
+                    send(Msg::Draped(frame, id, Err(e.to_string().into())));
+                }
+            }
+        });
+    }
+
+    fn photo_visible(&self) -> bool {
+        self.layers.iter().any(|l| l.id == "photo" && l.visible)
     }
 
     /// The visible layers, bottom first, with their opacity.
     fn stack(&self) -> Vec<(&'static str, f32)> {
+        let background = (!self.photo_visible()).then_some((BACKGROUND, 1.0));
         let visible = self.layers.iter().rev().filter(|l| l.visible);
-        visible.map(|l| (l.id, l.opacity)).collect()
+        background
+            .into_iter()
+            .chain(visible.map(|l| (l.id, l.opacity)))
+            .collect()
     }
 
     fn export(&mut self, frame: &eframe::Frame) {
@@ -642,8 +691,10 @@ impl Blocs {
     fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         if !self.draping.is_empty() {
             let names: Vec<_> = (self.layers.iter())
-                .filter(|l| self.draping.contains(l.id))
-                .map(|l| l.name)
+                .map(|l| (l.id, l.name))
+                .chain([(BACKGROUND, "Fond du Plan IGN")])
+                .filter(|(id, _)| self.draping.contains(id))
+                .map(|(_, name)| name)
                 .collect();
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -677,7 +728,7 @@ impl eframe::App for Blocs {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll(frame);
         self.refresh_lookup();
-        self.drape_visible();
+        self.drape_visible(frame.wgpu_render_state());
 
         egui::Panel::top("barre").show(ui, |ui| self.top_bar(ui));
 
@@ -708,6 +759,7 @@ impl eframe::App for Blocs {
             .rect_filled(ui.available_rect_before_wrap(), 0.0, egui::Color32::WHITE);
         let pan = !self.drawing && self.edit.is_none();
         let overview = self.map_memory.zoom() < layers::STACK_ZOOM as f64;
+        let photo = self.photo_visible();
         let mut map = Map::new(None, &mut self.map_memory, lon_lat(START.0, START.1))
             // walkers defaults to Ctrl + wheel zoom and plain-wheel panning.
             .zoom_with_ctrl(false)
@@ -723,7 +775,6 @@ impl eframe::App for Blocs {
             });
         // Zoomed out, the whole Plan IGN kept on disk; zoomed in, the chosen layers, bottom
         // first. The Plan IGN's white background would hide the photo, so it goes without.
-        let photo = self.layers.iter().any(|l| l.id == "photo" && l.visible);
         if overview || !photo {
             map = map.with_layer(&mut self.background, 1.0);
         }

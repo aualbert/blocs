@@ -39,7 +39,7 @@ const SEED_ZOOM: u8 = 10;
 const FRANCE: [f64; 4] = [-5.5, 41.2, 10.0, 51.2]; // lon/lat bounds, Corsica included
 /// Disk space for all tiles but the seeded ones.
 const CACHE_LIMIT: u64 = 500_000_000;
-const IGN: Attribution = Attribution {
+pub const IGN: Attribution = Attribution {
     text: "Source : IGN – Licence Ouverte",
     url: "https://geoservices.ign.fr/",
     logo_light: None,

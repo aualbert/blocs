@@ -20,7 +20,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// as displayed (not sRGB-aware), and its own pass has no depth buffer.
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Layer images stacked on the surface, mirrored in terrain.wgsl.
-pub const SLOTS: usize = 6;
+pub const SLOTS: usize = 8;
 
 // Vertex kinds and wall sides, mirrored in terrain.wgsl.
 const SURFACE: u8 = 0;
@@ -354,7 +354,12 @@ impl View3d {
                     self.opacity[2],
                     self.opacity[3],
                 ],
-                [self.opacity[4], self.opacity[5], 0.0, 0.0],
+                [
+                    self.opacity[4],
+                    self.opacity[5],
+                    self.opacity[6],
+                    self.opacity[7],
+                ],
             ],
         }
     }
@@ -365,14 +370,6 @@ impl View3d {
         let height = (width as f32 / self.aspect).round() as u32;
         let (device, queue) = (&rs.device, &rs.queue);
         let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
-        let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("export"),
-            size: (row * height) as u64,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-
         let renderer = rs.renderer.read();
         let gpu: &Gpu = renderer.callback_resources.get().expect("bloc chargé");
         queue.write_buffer(
@@ -382,34 +379,8 @@ impl View3d {
         );
         let mut encoder = device.create_command_encoder(&Default::default());
         gpu.render(&mut encoder, &target);
-        encoder.copy_texture_to_buffer(
-            target.texture.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: None,
-                },
-            },
-            target.texture.size(),
-        );
         queue.submit([encoder.finish()]);
-
-        let slice = readback.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("rendu terminé");
-        let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-        for line in slice
-            .get_mapped_range()
-            .expect("tampon lu")
-            .chunks(row as usize)
-        {
-            rgba.extend_from_slice(&line[..(width * 4) as usize]);
-        }
-        (width, height, rgba)
+        (width, height, read_texture(device, queue, &target.texture))
     }
 
     /// Gives the on-screen image back to egui, before this view is dropped.
@@ -732,7 +703,52 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
     gpu
 }
 
-/// An sRGB-coded image as a texture, sampled as is like the other colours of the shader.
+/// The pixels of a 4-byte texture, rows top to bottom, once the GPU work queued so far is done.
+pub fn read_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+) -> Vec<u8> {
+    let (width, height) = (texture.width(), texture.height());
+    let row = (width * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lecture"),
+        size: (row * height) as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: None,
+            },
+        },
+        texture.size(),
+    );
+    queue.submit([encoder.finish()]);
+
+    let slice = readback.slice(..);
+    slice.map_async(wgpu::MapMode::Read, |_| {});
+    device
+        .poll(wgpu::PollType::wait_indefinitely())
+        .expect("rendu terminé");
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for line in slice
+        .get_mapped_range()
+        .expect("tampon lu")
+        .chunks(row as usize)
+    {
+        rgba.extend_from_slice(&line[..(width * 4) as usize]);
+    }
+    rgba
+}
+
+/// An sRGB-coded, premultiplied image as a texture, sampled as is like the shader's colours.
 fn image_view(rs: &egui_wgpu::RenderState, image: &RgbaImage) -> wgpu::TextureView {
     rs.device
         .create_texture_with_data(
