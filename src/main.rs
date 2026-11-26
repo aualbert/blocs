@@ -1,136 +1,531 @@
+mod export;
+mod ign;
 mod lambert93;
+mod map;
 mod relief;
+mod tiles;
 mod view3d;
 
-use std::sync::mpsc::{Receiver, channel};
-use std::time::Instant;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::{Duration, Instant};
 
 use eframe::egui;
-use walkers::{
-    HttpOptions, HttpTiles, Map, MapMemory, Plugin, Position, Projector, TileId, lon_lat, sources,
-};
+use walkers::{Map, MapMemory, lon_lat};
 
+use ign::Place;
+use map::{Edit, Frame, FrameTool};
 use relief::{Heightmap, Progress};
+use tiles::PlanIgn;
 use view3d::View3d;
 
-/// Block side (m) and points per side at 5 m.
-const BLOCK: f64 = 10_000.0;
-const BLOCK_POINTS: usize = (BLOCK / relief::CELL) as usize + 1;
-
-/// Fond Plan IGN (Géoplateforme, WMTS en Web Mercator).
-struct PlanIgn;
-
-impl sources::TileUrls for PlanIgn {
-    fn tile_url(&self, tile_id: TileId) -> String {
-        format!(
-            "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0\
-            &LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png\
-            &TILEMATRIXSET=PM&TILEMATRIX={}&TILEROW={}&TILECOL={}",
-            tile_id.zoom, tile_id.y, tile_id.x
-        )
-    }
-
-    fn attribution(&self) -> sources::Attribution {
-        sources::Attribution {
-            text: "Source : IGN – Licence Ouverte",
-            url: "https://geoservices.ign.fr/",
-            logo_light: None,
-            logo_dark: None,
-        }
-    }
-}
+/// Map centre at start-up.
+const START: (f64, f64) = (2.35, 46.6);
+/// Export widths offered, in pixels.
+const EXPORT_WIDTHS: [u32; 3] = [1280, 1920, 3840];
 
 /// Messages from background work to the UI.
 enum Msg {
     Status(String),
-    Built(Heightmap, String),
+    Places(String, Vec<Place>),
+    /// For a frame: département names met, and the codes to download.
+    Departments(Frame, HashMap<String, String>, Vec<String>),
+    /// Archive size of a département, in bytes.
+    Size(String, u64),
+    Progress(String, Progress),
+    Installed(String),
+    /// The download stopped: paused or failed.
+    Stopped(String),
+    /// A block read from disk, with its description, or why it failed.
+    Built(Frame, relief::Result<(Heightmap, String)>),
+}
+
+/// Départements to download for the frame last queried.
+#[derive(Default)]
+struct Lookup {
+    frame: Option<Frame>,
+    codes: Option<Vec<String>>,
+}
+
+/// Relief downloads, one département at a time.
+struct Download {
+    queue: Vec<String>,
+    pause: Arc<AtomicBool>,
+    running: bool,
+    text: String,
+    fraction: f32,
 }
 
 struct Blocs {
-    tiles: HttpTiles,
-    map_memory: MapMemory,
-    /// Lambert-93 centre of the block frame.
-    center: Option<(f64, f64)>,
-    department: String,
+    ctx: egui::Context,
+    tx: Sender<Msg>,
+    rx: Receiver<Msg>,
     status: String,
-    task: Option<Receiver<Msg>>,
-    view: Option<View3d>,
+
+    tiles: PlanIgn,
+    map_memory: MapMemory,
+    frame: Option<Frame>,
+    edit: Option<Edit>,
+    drawing: bool,
+    search: String,
+    search_typed: Option<Instant>,
+    places: Vec<Place>,
+
+    installed: Vec<String>,
+    names: HashMap<String, String>,
+    sizes: HashMap<String, u64>,
+    in_frame: Lookup,
+    download: Download,
+
+    view3d: Option<View3d>,
+    built: Option<Frame>,
+    building: bool,
     show_3d: bool,
+    export_width: u32,
 }
 
 impl Blocs {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut map_memory = MapMemory::default();
         map_memory.set_zoom(6.0).expect("zoom valide");
-        let installed = relief::installed();
+        // Ctrl + wheel scrolls vertically (map panning) instead of zooming.
+        cc.egui_ctx.options_mut(|o| {
+            o.input_options.zoom_modifier = egui::Modifiers::NONE;
+            o.input_options.vertical_scroll_modifier = egui::Modifiers::CTRL;
+        });
+        let (tx, rx) = channel();
         Self {
-            // HttpOptions::default() envoie « blocs/<version> » comme User-Agent.
-            tiles: HttpTiles::with_options(PlanIgn, HttpOptions::default(), cc.egui_ctx.clone()),
+            ctx: cc.egui_ctx.clone(),
+            tx,
+            rx,
+            status: String::new(),
+            tiles: PlanIgn::new(cc.egui_ctx.clone()),
             map_memory,
-            center: None,
-            department: "D038".into(),
-            status: if installed.is_empty() {
-                "Aucun relief téléchargé.".into()
-            } else {
-                format!("Relief disponible : {}", installed.join(", "))
+            frame: None,
+            edit: None,
+            drawing: false,
+            search: String::new(),
+            search_typed: None,
+            places: Vec::new(),
+            installed: relief::installed(),
+            names: HashMap::new(),
+            sizes: HashMap::new(),
+            in_frame: Lookup::default(),
+            download: Download {
+                queue: Vec::new(),
+                pause: Arc::default(),
+                running: false,
+                text: String::new(),
+                fraction: 0.0,
             },
-            task: None,
-            view: None,
+            view3d: None,
+            built: None,
+            building: false,
             show_3d: false,
+            export_width: EXPORT_WIDTHS[1],
         }
     }
 
-    /// Runs `work` on a thread; it reports through the channel and wakes the UI.
-    fn spawn(&mut self, ctx: &egui::Context, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
-        let (tx, rx) = channel();
-        let ctx = ctx.clone();
+    /// Runs `work` on a thread; its messages wake the UI.
+    fn spawn(&self, work: impl FnOnce(&dyn Fn(Msg)) + Send + 'static) {
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         std::thread::spawn(move || {
             work(&|msg| {
                 let _ = tx.send(msg);
                 ctx.request_repaint();
             })
         });
-        self.task = Some(rx);
-    }
-
-    fn install(&mut self, ctx: &egui::Context) {
-        let dep = self.department.trim().to_uppercase();
-        self.spawn(ctx, move |send| {
-            let start = Instant::now();
-            let result = relief::install(&dep, |p| send(Msg::Status(progress_text(&p))));
-            send(Msg::Status(match result {
-                Ok(()) => format!("{dep} installé en {:.0} s.", start.elapsed().as_secs_f64()),
-                Err(e) => format!("Échec : {e}"),
-            }));
-        });
-    }
-
-    fn build(&mut self, ctx: &egui::Context, (x, y): (f64, f64)) {
-        self.spawn(ctx, move |send| {
-            send(Msg::Status("Construction du bloc…".into()));
-            match load_block(x, y) {
-                Ok((map, text)) => send(Msg::Built(map, text)),
-                Err(e) => send(Msg::Status(format!("Échec : {e}"))),
-            }
-        });
     }
 
     fn poll(&mut self, frame: &eframe::Frame) {
-        let Some(rx) = &self.task else { return };
-        for msg in rx.try_iter().collect::<Vec<_>>() {
+        while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Status(text) => self.status = text,
-                Msg::Built(map, text) => {
-                    let start = Instant::now();
-                    let rs = frame.wgpu_render_state().expect("rendu wgpu");
-                    self.view = Some(View3d::new(rs, &map));
-                    self.status = format!(
-                        "{text} · envoyé au GPU en {:.2} s",
-                        start.elapsed().as_secs_f64()
-                    );
-                    self.show_3d = true;
+                Msg::Places(query, places) => {
+                    if query == self.search.trim() {
+                        self.places = places;
+                    }
+                }
+                Msg::Departments(frame, names, codes) => {
+                    self.names.extend(names);
+                    if self.in_frame.frame == Some(frame) {
+                        self.in_frame.codes = Some(codes);
+                    }
+                }
+                Msg::Size(code, size) => {
+                    self.sizes.insert(code, size);
+                }
+                Msg::Progress(dep, p) => {
+                    let name = self.name(&dep);
+                    (self.download.text, self.download.fraction) = match p {
+                        Progress::Download { done, total } => (
+                            format!(
+                                "{name} : téléchargement {} / {} Mo",
+                                done / 1_000_000,
+                                total / 1_000_000
+                            ),
+                            done as f32 / total.max(1) as f32,
+                        ),
+                        Progress::Convert { done, total } => (
+                            format!("{name} : préparation {done} / {total} dalles"),
+                            done as f32 / total.max(1) as f32,
+                        ),
+                    };
+                }
+                Msg::Installed(dep) => {
+                    self.status = format!("Relief installé : {}.", self.name(&dep));
+                    self.download.queue.retain(|d| *d != dep);
+                    self.download.running = false;
+                    self.installed = relief::installed();
+                    self.next_download();
+                }
+                Msg::Stopped(error) => {
+                    self.download.running = false;
+                    if !self.download.pause.load(Ordering::Relaxed) {
+                        self.download.pause.store(true, Ordering::Relaxed);
+                        self.status = format!("Téléchargement interrompu : {error}");
+                    }
+                }
+                Msg::Built(built, result) => {
+                    self.building = false;
+                    match result {
+                        Ok((map, text)) => {
+                            let start = Instant::now();
+                            let rs = frame.wgpu_render_state().expect("rendu wgpu");
+                            self.view3d = Some(View3d::new(rs, &map));
+                            self.status = format!(
+                                "{text} · envoyé au GPU en {:.2} s",
+                                start.elapsed().as_secs_f64()
+                            );
+                            self.built = Some(built);
+                            self.show_3d = true;
+                        }
+                        Err(e) => self.status = format!("Échec : {e}"),
+                    }
                 }
             }
+        }
+    }
+
+    fn name(&self, dep: &str) -> String {
+        self.names
+            .get(dep)
+            .cloned()
+            .unwrap_or_else(|| dep.to_owned())
+    }
+
+    /// Finds the départements to download for `frame`, then their archive sizes.
+    fn look_up(&self, frame: Frame) {
+        let installed = self.installed.clone();
+        let known: HashSet<String> = self.sizes.keys().cloned().collect();
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        self.spawn(move |send| {
+            let http = match ign::client() {
+                Ok(http) => http,
+                Err(e) => return send(Msg::Status(format!("Réseau indisponible : {e}"))),
+            };
+            // Which départements touch each dalle of the frame, asked in parallel.
+            let dalles = relief::dalles([frame.x0, frame.y0, frame.x1, frame.y1]);
+            let answers: Vec<_> = std::thread::scope(|s| {
+                let jobs: Vec<_> = dalles
+                    .iter()
+                    .map(|&d| {
+                        let http = &http;
+                        s.spawn(move || ign::departments(http, d))
+                    })
+                    .collect();
+                jobs.into_iter().map(|j| j.join().unwrap()).collect()
+            });
+            let answers = match answers.into_iter().collect::<relief::Result<Vec<_>>>() {
+                Ok(answers) => answers,
+                Err(e) => return send(Msg::Status(format!("Départements introuvables : {e}"))),
+            };
+            let names: HashMap<_, _> = answers.iter().flatten().cloned().collect();
+            let per_dalle: Vec<Vec<String>> = answers
+                .iter()
+                .map(|deps| deps.iter().map(|d| d.0.clone()).collect())
+                .collect();
+            let needed = relief::cover(&per_dalle, &installed);
+            send(Msg::Departments(frame, names, needed.clone()));
+
+            // Sizes arrive one by one, so the offer shows without waiting for them.
+            for dep in needed.into_iter().filter(|d| !known.contains(d)) {
+                let (tx, ctx) = (tx.clone(), ctx.clone());
+                std::thread::spawn(move || {
+                    if let Ok(size) = relief::archive_size(&dep) {
+                        let _ = tx.send(Msg::Size(dep, size));
+                        ctx.request_repaint();
+                    }
+                });
+            }
+        });
+    }
+
+    /// Looks up the frame's départements once it stops moving.
+    fn refresh_lookup(&mut self) {
+        if let Some(frame) = self.frame
+            && self.edit.is_none()
+            && self.in_frame.frame != Some(frame)
+        {
+            self.in_frame = Lookup {
+                frame: Some(frame),
+                codes: None,
+            };
+            self.look_up(frame);
+        }
+    }
+
+    /// Départements of the frame still to download.
+    fn proposal(&self) -> Vec<String> {
+        let codes = self.in_frame.codes.iter().flatten();
+        codes
+            .filter(|c| !self.installed.contains(c) && !self.download.queue.contains(c))
+            .cloned()
+            .collect()
+    }
+
+    fn next_download(&mut self) {
+        let Some(dep) = self.download.queue.first().cloned() else {
+            return;
+        };
+        if self.download.running {
+            return;
+        }
+        self.download.running = true;
+        self.download.pause.store(false, Ordering::Relaxed);
+        let pause = self.download.pause.clone();
+        self.spawn(move |send| {
+            let result = relief::install(&dep, &pause, |p| send(Msg::Progress(dep.clone(), p)));
+            send(match result {
+                Ok(()) => Msg::Installed(dep),
+                Err(e) => Msg::Stopped(e.to_string()),
+            });
+        });
+    }
+
+    /// Why the 3D view can't open yet, if it can't.
+    fn missing_3d(&self) -> Option<String> {
+        if self.frame.is_none() {
+            return Some("Tracez d'abord un cadre sur la carte.".into());
+        }
+        let codes = self.in_frame.codes.as_ref()?;
+        let missing: Vec<_> = codes
+            .iter()
+            .filter(|c| !self.installed.contains(c))
+            .map(|c| self.name(c))
+            .collect();
+        (!missing.is_empty())
+            .then(|| format!("Téléchargez d'abord le relief : {}.", missing.join(", ")))
+    }
+
+    fn open_3d(&mut self) {
+        let Some(frame) = self.frame else { return };
+        if self.built == Some(frame) {
+            self.show_3d = true;
+        } else if !self.building {
+            self.building = true;
+            self.status = "Construction du bloc…".into();
+            self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
+        }
+    }
+
+    fn export(&mut self, frame: &eframe::Frame) {
+        let (Some(view), Some(rs)) = (&self.view3d, frame.wgpu_render_state()) else {
+            return;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .set_file_name("bloc.png")
+            .add_filter("Image PNG", &["png"])
+            .save_file()
+        else {
+            return;
+        };
+        let (w, h, rgba) = view.render_image(rs, self.export_width);
+        self.status = "Enregistrement de l'image…".into();
+        self.spawn(move |send| {
+            send(Msg::Status(match export::save_png(&path, w, h, rgba) {
+                Ok(()) => format!("Image enregistrée : {}", path.display()),
+                Err(e) => format!("Échec de l'export : {e}"),
+            }))
+        });
+    }
+
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.show_3d, false, "Carte");
+            let missing = self.missing_3d();
+            let button = ui
+                .add_enabled(
+                    missing.is_none(),
+                    egui::Button::selectable(self.show_3d, "3D"),
+                )
+                .on_disabled_hover_text(missing.unwrap_or_default());
+            if button.clicked() {
+                self.open_3d();
+            }
+            ui.separator();
+
+            let search = ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("Rechercher un lieu…")
+                    .desired_width(260.0),
+            );
+            if search.changed() {
+                self.search_typed = Some(Instant::now());
+                self.places.clear();
+            }
+            if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                self.go_to(0);
+            }
+            self.search_results(ui, &search);
+
+            if !self.show_3d {
+                ui.separator();
+                ui.toggle_value(&mut self.drawing, "Tracer le cadre")
+                    .on_hover_text(
+                        "Glissez sur la carte pour tracer le cadre (10 km au plus par côté).",
+                    );
+                if let Some(frame) = self.frame {
+                    ui.label(format!("Cadre {}", frame.label()));
+                }
+            }
+            ui.separator();
+            ui.label(&self.status);
+        });
+    }
+
+    /// Autocompletion list under the search box.
+    fn search_results(&mut self, ui: &mut egui::Ui, search: &egui::Response) {
+        if let Some(t) = self.search_typed {
+            let query = self.search.trim().to_owned();
+            if t.elapsed() < Duration::from_millis(300) {
+                ui.ctx().request_repaint_after(Duration::from_millis(300));
+            } else {
+                self.search_typed = None;
+                if query.chars().count() >= 3 {
+                    self.spawn(move |send| {
+                        if let Ok(places) = ign::search(&query) {
+                            send(Msg::Places(query, places));
+                        }
+                    });
+                }
+            }
+        }
+        if self.places.is_empty() {
+            return;
+        }
+        let mut chosen = None;
+        let area = egui::Area::new(egui::Id::unique("résultats"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(search.rect.left_bottom())
+            .show(ui.ctx(), |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_width(search.rect.width());
+                    for (k, place) in self.places.iter().enumerate() {
+                        if ui.selectable_label(false, &place.label).clicked() {
+                            chosen = Some(k);
+                        }
+                    }
+                });
+            });
+        if let Some(k) = chosen {
+            self.go_to(k);
+        } else {
+            // Escape, or a click elsewhere, closes the list.
+            let (escape, pressed) =
+                ui.input(|i| (i.key_pressed(egui::Key::Escape), i.pointer.any_pressed()));
+            let outside = !area.response.contains_pointer() && !search.contains_pointer();
+            if escape || (pressed && outside) {
+                self.places.clear();
+            }
+        }
+    }
+
+    /// Centres the map on the `k`-th search result.
+    fn go_to(&mut self, k: usize) {
+        let Some(place) = self.places.get(k) else {
+            return;
+        };
+        self.map_memory.center_at(lon_lat(place.lon, place.lat));
+        let _ = self.map_memory.set_zoom(13.0);
+        self.search = place.label.clone();
+        self.places.clear();
+    }
+
+    /// Offer to download the relief, or show the download in progress.
+    fn download_bar(&mut self, ui: &mut egui::Ui) {
+        let proposal = self.proposal();
+        let offer = !proposal.is_empty();
+        if !offer && self.download.queue.is_empty() {
+            return;
+        }
+        egui::Panel::bottom("téléchargement").show(ui, |ui| {
+            if !self.download.queue.is_empty() {
+                ui.horizontal(|ui| {
+                    let paused = !self.download.running;
+                    if ui
+                        .button(if paused { "Reprendre" } else { "Pause" })
+                        .clicked()
+                    {
+                        if paused {
+                            self.next_download();
+                        } else {
+                            self.download.pause.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    let mut text = self.download.text.clone();
+                    if self.download.queue.len() > 1 {
+                        text += &format!(" · {} en attente", self.download.queue.len() - 1);
+                    }
+                    if paused {
+                        text += " · en pause";
+                    }
+                    ui.add(egui::ProgressBar::new(self.download.fraction).text(text));
+                });
+            }
+            if offer {
+                ui.horizontal(|ui| {
+                    let names: Vec<_> = proposal.iter().map(|d| self.name(d)).collect();
+                    ui.label(format!("Relief à télécharger : {}", names.join(", ")));
+                    // The total shows once every size is known.
+                    let sizes: Option<Vec<u64>> = proposal
+                        .iter()
+                        .map(|d| self.sizes.get(d).copied())
+                        .collect();
+                    let label = match sizes {
+                        Some(s) => format!("Télécharger ({})", megabytes(s.iter().sum())),
+                        None => "Télécharger".into(),
+                    };
+                    if ui.button(label).clicked() {
+                        self.download.queue.extend(proposal);
+                        self.next_download();
+                    }
+                });
+            }
+        });
+    }
+
+    fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let Some(view) = &mut self.view3d else { return };
+        ui.label("Étirement du relief");
+        ui.add(egui::Slider::new(&mut view.exaggeration, 1.0..=2.0).prefix("×"));
+        ui.label("Profondeur du socle");
+        ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=2000.0).suffix(" m"));
+        ui.separator();
+        ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas");
+        ui.separator();
+        ui.label("Image PNG (fond transparent)");
+        egui::ComboBox::from_id_salt("largeur")
+            .selected_text(format!("{} px", self.export_width))
+            .show_ui(ui, |ui| {
+                for w in EXPORT_WIDTHS {
+                    ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
+                }
+            });
+        if ui.button("Exporter…").clicked() {
+            self.export(frame);
         }
     }
 }
@@ -138,90 +533,57 @@ impl Blocs {
 impl eframe::App for Blocs {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.poll(frame);
+        self.refresh_lookup();
 
-        egui::Panel::top("barre").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.show_3d, false, "Carte");
-                let can_3d = self.view.is_some();
-                ui.add_enabled_ui(can_3d, |ui| {
-                    ui.selectable_value(&mut self.show_3d, true, "3D")
-                })
-                .response
-                .on_disabled_hover_text("Cliquez sur la carte pour construire un bloc.");
-                ui.separator();
-                ui.label("Département");
-                ui.add(egui::TextEdit::singleline(&mut self.department).desired_width(50.0));
-                if ui.button("Télécharger le relief").clicked() {
-                    self.install(ui.ctx());
-                }
-                ui.separator();
-                ui.label(&self.status);
-            });
-        });
+        egui::Panel::top("barre").show(ui, |ui| self.top_bar(ui));
 
-        if self.show_3d
-            && let Some(view) = &mut self.view
-        {
-            egui::Panel::right("réglages").show(ui, |ui| {
-                ui.label("Étirement du relief");
-                ui.add(egui::Slider::new(&mut view.exaggeration, 1.0..=5.0).prefix("×"));
-                ui.label("Profondeur du socle");
-                ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=3000.0).suffix(" m"));
-            });
-            view.ui(ui);
+        if self.show_3d && self.view3d.is_some() {
+            egui::Panel::right("réglages").show(ui, |ui| self.settings_3d(ui, frame));
+            if let Some(view) = &mut self.view3d {
+                view.ui(ui);
+            }
             return;
         }
 
-        let mut clicked = None;
+        self.download_bar(ui);
+        // Shift + wheel pans east-west, Ctrl + wheel north-south; the plain wheel zooms.
+        let scroll = ui.input(|i| i.smooth_scroll_delta);
+        let modifiers = ui.input(|i| i.modifiers);
+        if (modifiers.shift || modifiers.ctrl)
+            && scroll != egui::Vec2::ZERO
+            && ui.rect_contains_pointer(ui.available_rect_before_wrap())
+        {
+            map::pan(&mut self.map_memory, lon_lat(START.0, START.1), scroll);
+            ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+        }
+        let pan = !self.drawing && self.edit.is_none();
         ui.add(
             Map::new(
                 Some(&mut self.tiles),
                 &mut self.map_memory,
-                lon_lat(2.35, 46.6),
+                lon_lat(START.0, START.1),
             )
-            .with_plugin(Frame {
-                center: self.center,
-                clicked: &mut clicked,
+            // walkers defaults to Ctrl + wheel zoom and plain-wheel panning.
+            .zoom_with_ctrl(false)
+            .drag_pan_buttons(if pan {
+                egui::DragPanButtons::PRIMARY
+            } else {
+                egui::DragPanButtons::empty()
+            })
+            .with_plugin(FrameTool {
+                frame: &mut self.frame,
+                edit: &mut self.edit,
+                drawing: &mut self.drawing,
             }),
         );
-        if let Some(center) = clicked {
-            self.center = Some(center);
-            self.build(ui.ctx(), center);
-        }
     }
 }
 
-/// Draws the block frame on the map and reports clicks as Lambert-93 centres.
-struct Frame<'a> {
-    center: Option<(f64, f64)>,
-    clicked: &'a mut Option<(f64, f64)>,
-}
-
-impl Plugin for Frame<'_> {
-    fn run(
-        self: Box<Self>,
-        ui: &mut egui::Ui,
-        response: &egui::Response,
-        projector: &Projector,
-        _: &MapMemory,
-    ) {
-        if response.clicked()
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            let p: Position = projector.unproject(pos.to_vec2());
-            *self.clicked = Some(lambert93::from_wgs84(p.x(), p.y()));
-        }
-        let Some((x, y)) = self.center else { return };
-
-        // The square is in Lambert-93, so it shows slightly rotated on Web Mercator.
-        let h = BLOCK / 2.0;
-        let corners = [(-h, -h), (h, -h), (h, h), (-h, h)].map(|(dx, dy)| {
-            let (lon, lat) = lambert93::to_wgs84(x + dx, y + dy);
-            projector.project(lon_lat(lon, lat)).to_pos2()
-        });
-        let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(220, 40, 40));
-        ui.painter()
-            .add(egui::Shape::closed_line(corners.to_vec(), stroke));
+fn megabytes(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1} Go", bytes as f64 / 1e9).replace('.', ",")
+    } else {
+        format!("{} Mo", bytes / 1_000_000)
     }
 }
 
@@ -236,16 +598,16 @@ fn progress_text(p: &Progress) -> String {
     }
 }
 
-/// Reads the block centred on Lambert-93 `(x, y)` and describes it with its read time.
-fn load_block(x: f64, y: f64) -> relief::Result<(Heightmap, String)> {
+/// Reads the block of `frame` and describes it with its read time.
+fn load_block(frame: &Frame) -> relief::Result<(Heightmap, String)> {
     let start = Instant::now();
-    let map = Heightmap::load(x - BLOCK / 2.0, y - BLOCK / 2.0, BLOCK_POINTS)?;
+    let (nx, ny) = frame.points();
+    let map = Heightmap::load(frame.x0, frame.y0, nx, ny)?;
     let (lo, hi) = map.range();
     let text = format!(
-        "Bloc {n} × {n} points lu en {:.2} s · altitudes {lo:.0}–{hi:.0} m · {} points comblés",
+        "Bloc {nx} × {ny} points lu en {:.2} s · altitudes {lo:.0}–{hi:.0} m · {} points comblés",
         start.elapsed().as_secs_f64(),
         map.holes,
-        n = map.size,
     );
     Ok((map, text))
 }
@@ -256,11 +618,13 @@ fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["bloc", lon, lat] => {
-            let (x, y) =
-                lambert93::from_wgs84(lon.parse().unwrap_or(0.0), lat.parse().unwrap_or(0.0));
-            cli(|_| load_block(x, y).map(|(_, text)| println!("{text}")))
+            let frame = Frame::square(lambert93::from_wgs84(
+                lon.parse().unwrap_or(0.0),
+                lat.parse().unwrap_or(0.0),
+            ));
+            cli(|_| load_block(&frame).map(|(_, text)| println!("{text}")))
         }
-        ["installer", dep] => cli(|p| relief::install(dep, p)),
+        ["installer", dep] => cli(|p| relief::install(dep, &AtomicBool::new(false), p)),
         ["convertir", archive, dep] => {
             cli(|p| relief::convert(archive.as_ref(), &relief::department_dir(dep), p))
         }

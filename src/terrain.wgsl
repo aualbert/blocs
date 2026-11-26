@@ -2,9 +2,9 @@
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    params: vec4<f32>, // exaggeration, base depth (m), cell (m), points per side
+    params: vec4<f32>, // exaggeration, base depth (m), cell (m), unused
+    grid: vec4<f32>,   // points east, points north, min height, max height (m)
     sun: vec4<f32>,    // direction towards the sun
-    range: vec4<f32>,  // min height, max height (m)
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -23,8 +23,8 @@ struct Out {
 };
 
 fn height(i: i32, j: i32) -> f32 {
-    let n = i32(u.params.w);
-    return textureLoad(heights, clamp(vec2(i, j), vec2(0), vec2(n - 1)), 0).r;
+    let n = vec2(i32(u.grid.x), i32(u.grid.y));
+    return textureLoad(heights, clamp(vec2(i, j), vec2(0), n - 1), 0).r;
 }
 
 // Hypsometric tint by absolute altitude.
@@ -42,13 +42,13 @@ fn tint(h: f32) -> vec3<f32> {
 fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> Out {
     let exag = u.params.x;
     let cell = u.params.z;
-    let half = (u.params.w - 1.0) * 0.5;
+    let half = (u.grid.xy - 1.0) * 0.5;
     let i = i32(grid.x);
     let j = i32(grid.y);
     let h = height(i, j);
 
     // x east, y up, z south; heights relative to the block's lowest point.
-    var p = vec3((f32(i) - half) * cell, (h - u.range.x) * exag, (half - f32(j)) * cell);
+    var p = vec3((f32(i) - half.x) * cell, (h - u.grid.z) * exag, (half.y - f32(j)) * cell);
     var out: Out;
     switch kind_side.x {
         case SURFACE: {

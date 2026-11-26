@@ -41,7 +41,7 @@ La bascule vers la 3D est donc immédiate une fois le relief installé.
 nix develop
 cargo run --release -- installer D038        # télécharge, convertit, mesure
 cargo run --release -- bloc 5.95 45.15       # lit un bloc de 10 km centré sur lon/lat
-cargo run --release                          # application : clic sur la carte → bloc 3D
+cargo run --release                          # application : tracer un cadre, télécharger, 3D
 ```
 
 Données stockées dans `~/.local/share/blocs/relief/<département>/`.
