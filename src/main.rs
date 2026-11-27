@@ -53,8 +53,8 @@ enum Msg {
     Installed(String),
     /// The download stopped: paused or failed.
     Stopped(String),
-    /// A block read from disk, with its grid for the GPU, or why it failed.
-    Built(Frame, relief::Result<(Heightmap, view3d::Grid)>),
+    /// A block read from disk, prepared for the GPU, or why it failed.
+    Built(Frame, relief::Result<(Heightmap, view3d::Prepared)>),
     /// A layer's image over a block's frame, with its mipmaps.
     Draped(Frame, &'static str, relief::Result<Vec<image::RgbaImage>>),
     /// The 3D buildings of a block's frame.
@@ -418,14 +418,15 @@ impl Blocs {
                 Msg::Built(built, result) => {
                     self.building = false;
                     match result {
-                        Ok((map, grid)) => {
+                        Ok((map, prepared)) => {
                             let rs = frame.wgpu_render_state().expect("rendu wgpu");
                             if let Some(old) = &mut self.view3d {
                                 old.release(rs);
                             }
                             let (x, y) = built.centre();
                             let latitude = lambert93::to_wgs84(x, y).1;
-                            self.view3d = Some(View3d::new(rs, &map, &grid, latitude, built.angle));
+                            self.view3d =
+                                Some(View3d::new(rs, &map, &prepared, latitude, built.angle));
                             // The new block starts without layer images.
                             self.draped.clear();
                             self.draping.clear();
@@ -544,8 +545,8 @@ impl Blocs {
             // The description is for the headless command only.
             self.spawn(move |send| {
                 let block = load_block(&frame).map(|(map, _)| {
-                    let grid = view3d::mesh(map.nx, map.ny);
-                    (map, grid)
+                    let prepared = view3d::prepare(&map);
+                    (map, prepared)
                 });
                 send(Msg::Built(frame, block))
             });

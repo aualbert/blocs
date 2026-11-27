@@ -10,6 +10,36 @@ pub const STEP: usize = 2;
 /// Width of a shadow's fading edge, in steps.
 const SOFT: f32 = 3.0;
 
+/// Heights (degrees) and number of directions of the suns whose shadows make `sky`. Each
+/// height stands for an equal share of the light the sky sheds on level ground: most of it
+/// comes from high up (cosine law), so the heights are 90° − asin(√((k + ½) / 3)).
+const SKY_HEIGHTS: [f32; 3] = [65.9, 45.0, 24.1];
+const SKY_DIRECTIONS: usize = 8;
+
+/// Share of the sky each point sees, every STEP points, 255 under an open sky: the relief's
+/// shadows under suns all around, averaged. Valleys and gullies see less of it. Slow (tens
+/// of ms), once per block: off the UI thread.
+pub fn sky(heights: &[f32], nx: usize, ny: usize) -> Vec<u8> {
+    let suns = SKY_HEIGHTS.iter().flat_map(|h| {
+        let (sh, ch) = h.to_radians().sin_cos();
+        (0..SKY_DIRECTIONS).map(move |k| {
+            let a = (k as f32 + 0.5) * std::f32::consts::TAU / SKY_DIRECTIONS as f32;
+            Vec3::new(a.cos() * ch, sh, a.sin() * ch)
+        })
+    });
+    // One thread per sun.
+    let masks: Vec<Vec<u8>> = std::thread::scope(|s| {
+        let jobs: Vec<_> = suns
+            .map(|sun| s.spawn(move || mask(heights, nx, ny, sun)))
+            .collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+    let n = masks.len() as u32;
+    (0..masks[0].len())
+        .map(|k| (masks.iter().map(|m| m[k] as u32).sum::<u32>() / n) as u8)
+        .collect()
+}
+
 /// Size of the shadow mask for a grid of `nx` × `ny` points.
 pub fn size(nx: usize, ny: usize) -> (usize, usize) {
     ((nx - 1) / STEP + 1, (ny - 1) / STEP + 1)
@@ -83,6 +113,23 @@ pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trench_sees_less_sky_than_open_ground() {
+        // Flat ground, with a 100 m deep, 20 m wide trench running north-south in the middle.
+        let (nx, ny) = (41, 41);
+        let mut h = vec![0.0; nx * ny];
+        for j in 0..ny {
+            for i in 18..23 {
+                h[j * nx + i] = -100.0;
+            }
+        }
+        let sky = sky(&h, nx, ny);
+        let mx = size(nx, ny).0;
+        let at = |i: usize| sky[10 * mx + i / STEP];
+        assert_eq!(at(0), 255);
+        assert!(at(20) < 128, "{}", at(20));
+    }
 
     #[test]
     fn wall_shades_the_east_under_a_western_sun() {

@@ -65,8 +65,9 @@ struct Gpu {
     bind_group: wgpu::BindGroup,
     uniforms: wgpu::Buffer,
     heights: wgpu::TextureView,
-    /// Where the sun reaches the surface, see shadow.rs.
+    /// Where the sun reaches the surface, and the share of the sky seen, see shadow.rs.
     shadows: wgpu::Texture,
+    sky: wgpu::TextureView,
     sampler: wgpu::Sampler,
     /// Transparent 1 × 1 image for empty slots.
     blank: wgpu::TextureView,
@@ -172,16 +173,16 @@ const AXES: [(&str, [f32; 3], f32, f32); 6] = [
 ];
 
 impl View3d {
-    /// Uploads the block and its `grid` to the GPU, replacing the previous one; `latitude`
-    /// in degrees, `angle` the frame's.
+    /// Uploads the block, `prepared` for it, to the GPU, replacing the previous one;
+    /// `latitude` in degrees, `angle` the frame's.
     pub fn new(
         render_state: &egui_wgpu::RenderState,
         map: &Heightmap,
-        grid: &Grid,
+        prepared: &Prepared,
         latitude: f64,
         angle: f64,
     ) -> Self {
-        let gpu = upload(render_state, map, grid);
+        let gpu = upload(render_state, map, prepared);
         render_state.renderer.write().callback_resources.insert(gpu);
         let cell = CELL as f32;
         let extent = ((map.nx - 1) as f32 * cell, (map.ny - 1) as f32 * cell);
@@ -669,6 +670,10 @@ impl Gpu {
             binding: 3 + SLOTS as u32,
             resource: wgpu::BindingResource::TextureView(&shadows),
         });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 4 + SLOTS as u32,
+            resource: wgpu::BindingResource::TextureView(&self.sky),
+        });
         self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -716,15 +721,27 @@ impl Gpu {
     }
 }
 
-/// The block's vertices and indices, which `View3d::new` uploads.
-pub struct Grid {
+/// What the GPU needs of a block that is slow to make, which `View3d::new` uploads.
+pub struct Prepared {
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
+    /// Share of the sky each point sees, see shadow.rs.
+    sky: Vec<u8>,
+}
+
+/// Prepares a block for the GPU. Slow on big blocks: off the UI thread.
+pub fn prepare(map: &Heightmap) -> Prepared {
+    let (vertices, indices) = mesh(map.nx, map.ny);
+    let sky = shadow::sky(&map.heights, map.nx, map.ny);
+    Prepared {
+        vertices,
+        indices,
+        sky,
+    }
 }
 
 /// Surface grid, then two vertices per edge point for the walls, then the 4 floor corners.
-/// Slow on big blocks: off the UI thread.
-pub fn mesh(nx: usize, ny: usize) -> Grid {
+fn mesh(nx: usize, ny: usize) -> (Vec<Vertex>, Vec<u32>) {
     let v = |i: usize, j: usize, kind: u8, side: u8| Vertex {
         grid: [i as u16, j as u16],
         kind_side: [kind, side, 0, 0],
@@ -774,10 +791,10 @@ pub fn mesh(nx: usize, ny: usize) -> Grid {
         v(nx - 1, ny - 1, FLOOR, 0),
     ]);
     quad(start, start + 1, start + 2, start + 3);
-    Grid { vertices, indices }
+    (vertices, indices)
 }
 
-fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
+fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, prepared: &Prepared) -> Gpu {
     let device = &rs.device;
 
     let texture = device.create_texture_with_data(
@@ -800,8 +817,9 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
         bytemuck::cast_slice(&map.heights),
     );
     let (mx, my) = shadow::size(map.nx, map.ny);
-    let shadows = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("ombres"),
+    // The shadows and the sky seen share their size and spacing.
+    let mask = |label| wgpu::TextureDescriptor {
+        label: Some(label),
         size: wgpu::Extent3d {
             width: mx as u32,
             height: my as u32,
@@ -813,7 +831,14 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
         format: wgpu::TextureFormat::R8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    };
+    let shadows = device.create_texture(&mask("ombres"));
+    let sky = device.create_texture_with_data(
+        &rs.queue,
+        &mask("ciel"),
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &prepared.sky,
+    );
     let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("uniforms"),
         size: size_of::<Uniforms>() as u64,
@@ -850,8 +875,8 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
             count: None,
         },
     ];
-    // The layers, then the shadows.
-    for slot in 0..=SLOTS {
+    // The layers, then the shadows and the sky seen.
+    for slot in 0..SLOTS + 2 {
         entries.push(wgpu::BindGroupLayoutEntry {
             binding: 3 + slot as u32,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -933,7 +958,9 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
         },
     );
 
-    let Grid { vertices, indices } = grid;
+    let Prepared {
+        vertices, indices, ..
+    } = prepared;
     let buffer = |label, contents: &[u8], usage| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
@@ -957,6 +984,7 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
         uniforms,
         heights: texture.create_view(&Default::default()),
         shadows,
+        sky: sky.create_view(&Default::default()),
         sampler,
         blank,
         layers: HashMap::new(),

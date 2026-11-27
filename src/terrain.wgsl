@@ -24,6 +24,8 @@ struct Uniforms {
 // Where the sun reaches the surface (shadow.rs), and its spacing in grid points.
 @group(0) @binding(12) var shadows: texture_2d<f32>;
 const SHADOW_STEP: f32 = 2.0;
+// Share of the sky each point sees (shadow.rs), on the shadows' grid.
+@group(0) @binding(13) var sky_seen: texture_2d<f32>;
 
 // Vertex kinds, see view3d.rs.
 const SURFACE: u32 = 0u;
@@ -149,12 +151,17 @@ fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
     return below * (1.0 - layer.a * opacity) + layer.rgb * opacity;
 }
 
-// Share of direct sunlight at `p`: the relief's shadows, cast every SHADOW_STEP points.
-fn sunlit(p: vec3<f32>) -> f32 {
+// Position of `p` on the shadows' grid, 0..1.
+fn on_mask(p: vec3<f32>) -> vec2<f32> {
     let half = (u.grid.xy - 1.0) * 0.5;
     let g = vec2(p.x / u.params.z + half.x, half.y - p.z / u.params.z);
+    return (g / SHADOW_STEP + 0.5) / vec2<f32>(textureDimensions(shadows));
+}
+
+// Share of direct sunlight at `p`: the relief's shadows, cast every SHADOW_STEP points.
+fn sunlit(p: vec3<f32>) -> f32 {
     let size = vec2<f32>(textureDimensions(shadows));
-    let uv = (g / SHADOW_STEP + 0.5) / size;
+    let uv = on_mask(p);
     // Four samples around, blurring the grid's steps away.
     let d = 0.6 / size;
     return 0.25 * (textureSampleLevel(shadows, samp, uv + vec2(-d.x, -d.y), 0.0).r
@@ -174,10 +181,12 @@ fn ink(in: Out) -> f32 {
 }
 
 // Share of the light coming from the whole sky rather than the sun (linear).
-const AMBIENT: f32 = 0.07;
+const AMBIENT: f32 = 0.15;
 // That light from above, bluish, and bounced up from the ground, warm.
 const SKY: vec3<f32> = vec3(0.80, 0.88, 1.0);
 const BOUNCE: vec3<f32> = vec3(0.95, 0.88, 0.78);
+// Light the relief sends back where it hides the sky, as a share of the sky's.
+const RELIEF_GLOW: f32 = 0.3;
 
 // The sun's colour (linear): orange on the horizon, white from 30° up, as the sky's glow in
 // view3d.rs `paint_sky`.
@@ -208,7 +217,12 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // linear colours, then coded back for display, so that shade stays clear.
     let n = normalize(in.normal);
     let direct = max(dot(n, u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
-    let light = AMBIENT * mix(BOUNCE, SKY, 0.5 + 0.5 * n.y) + (1.0 - AMBIENT) * sunlight() * direct;
+    // The sky's light, from what of it each point sees; where the relief hides it, the
+    // relief's own light, dimmer and warm. The sun's light is left alone.
+    let seen = mix(1.0, textureSampleLevel(sky_seen, samp, on_mask(in.world), 0.0).r, in.shaded);
+    let skylight = mix(BOUNCE, SKY, 0.5 + 0.5 * n.y);
+    let ambient = AMBIENT * mix(RELIEF_GLOW * BOUNCE, skylight, seen);
+    let light = ambient + (1.0 - AMBIENT) * sunlight() * direct;
     let lit = pow(pow(color, vec3(2.2)) * light, vec3(1.0 / 2.2)) * (1.0 - 0.2 * down);
     // Light ink: a faint line, as in pencil.
     return vec4(mix(lit, vec3(0.2), 0.15 * line), 1.0);
