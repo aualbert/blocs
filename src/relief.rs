@@ -51,6 +51,18 @@ pub fn installed() -> Vec<String> {
     deps
 }
 
+/// Disk space taken by a département's relief, in bytes.
+pub fn disk_use(dep: &str) -> u64 {
+    let files = fs::read_dir(department_dir(dep))
+        .into_iter()
+        .flatten()
+        .flatten();
+    files
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// Archive volumes `(url, bytes)` of the latest 5 m ASC edition for a département (`"D038"`).
 pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
     let http = client()?;

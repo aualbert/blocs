@@ -37,7 +37,7 @@ const RETRY: Duration = Duration::from_secs(30);
 /// and deeper levels always have a coarser tile to stand in while loading.
 const SEED_ZOOM: u8 = 10;
 const FRANCE: [f64; 4] = [-5.5, 41.2, 10.0, 51.2]; // lon/lat bounds, Corsica included
-/// Disk space for all tiles but the seeded ones.
+/// Disk space for all tiles but the seeded ones, unless changed in the options.
 const CACHE_LIMIT: u64 = 500_000_000;
 pub const IGN: Attribution = Attribution {
     text: "Source : IGN – Licence Ouverte",
@@ -501,21 +501,52 @@ fn worker(
     }
 }
 
-/// Deletes the least recently used tiles, seeded ones apart, until they fit in `CACHE_LIMIT`.
-pub fn trim_cache() {
-    let mut tiles = Vec::new(); // (last use, bytes, path)
+fn limit_file() -> PathBuf {
+    data_dir().join("limite_cache")
+}
+
+/// Disk space for all tiles but the seeded ones, in bytes.
+pub fn cache_limit() -> u64 {
+    let saved = fs::read_to_string(limit_file()).ok();
+    saved
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(CACHE_LIMIT)
+}
+
+/// Saves a new cache limit, then trims the cache to it.
+pub fn set_cache_limit(bytes: u64) {
+    let _ = fs::create_dir_all(data_dir());
+    let _ = fs::write(limit_file(), bytes.to_string());
+    trim_cache();
+}
+
+/// Disk space of the seeded tiles, or of the cached ones, in bytes.
+pub fn disk_use(seeded: bool) -> u64 {
+    on_disk(seeded).iter().map(|t| t.1).sum()
+}
+
+/// Deletes all the seeded tiles, or all the cached ones.
+pub fn delete(seeded: bool) {
+    for (_, _, path) in on_disk(seeded) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// The seeded tiles, or the cached ones, as `(last use, bytes, path)`.
+fn on_disk(seeded: bool) -> Vec<(SystemTime, u64, PathBuf)> {
+    let mut tiles = Vec::new();
     let layers = fs::read_dir(data_dir().join("tuiles"))
         .into_iter()
         .flatten();
     for layer in layers.flatten() {
-        let seeded = layer.file_name() == "planign";
+        let plan = layer.file_name() == "planign";
         for zoom in fs::read_dir(layer.path()).into_iter().flatten().flatten() {
             let z: u8 = zoom
                 .file_name()
                 .to_str()
                 .and_then(|z| z.parse().ok())
                 .unwrap_or(0);
-            if seeded && z <= SEED_ZOOM {
+            if (plan && z <= SEED_ZOOM) != seeded {
                 continue;
             }
             for column in fs::read_dir(zoom.path()).into_iter().flatten().flatten() {
@@ -528,14 +559,20 @@ pub fn trim_cache() {
             }
         }
     }
+    tiles
+}
+
+/// Deletes the least recently used tiles, seeded ones apart, until they fit in the limit.
+pub fn trim_cache() {
+    let (mut tiles, limit) = (on_disk(false), cache_limit());
     let mut total: u64 = tiles.iter().map(|t| t.1).sum();
-    if total <= CACHE_LIMIT {
+    if total <= limit {
         return;
     }
     // Trim to 80 % of the limit, so this does not run again at every start.
     tiles.sort();
     for (_, len, path) in tiles {
-        if total <= CACHE_LIMIT / 5 * 4 {
+        if total <= limit / 5 * 4 {
             break;
         }
         if fs::remove_file(path).is_ok() {

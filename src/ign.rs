@@ -50,11 +50,11 @@ pub fn search(text: &str) -> Result<Vec<Place>> {
         .collect())
 }
 
-/// Départements `(code, name)` touching a Lambert-93 rectangle, codes as in RGE ALTI (`"D038"`).
+/// Départements touching a Lambert-93 rectangle, coded as in RGE ALTI (`"D038"`).
 pub fn departments(
     http: &reqwest::blocking::Client,
     [x0, y0, x1, y1]: [f64; 4],
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<String>> {
     // An exact geometry test: the WFS BBOX filter only compares envelopes.
     let filter = format!(
         "INTERSECTS(geometrie,SRID=2154;POLYGON(({x0} {y0},{x1} {y0},{x1} {y1},{x0} {y1},{x0} {y0})))"
@@ -67,7 +67,7 @@ pub fn departments(
             ("REQUEST", "GetFeature"),
             ("TYPENAMES", "ADMINEXPRESS-COG-CARTO.LATEST:departement"),
             ("outputFormat", "application/json"),
-            ("PROPERTYNAME", "code_insee,nom_officiel"),
+            ("PROPERTYNAME", "code_insee"),
             ("CQL_FILTER", &filter),
         ])
         .timeout(SHORT)
@@ -79,24 +79,132 @@ pub fn departments(
     let mut deps: Vec<_> = features
         .iter()
         .filter_map(|f| {
-            let p = &f["properties"];
-            let code = p["code_insee"].as_str()?;
+            let code = f["properties"]["code_insee"].as_str()?;
             // Overseas départements (3-digit codes) are outside the v1 scope.
-            (code.len() == 2).then_some(())?;
-            Some((
-                format!("D{code:0>3}"),
-                p["nom_officiel"].as_str()?.to_owned(),
-            ))
+            (code.len() == 2).then(|| format!("D{code:0>3}"))
         })
         .collect();
     deps.sort();
     Ok(deps)
 }
 
+/// A département's name from its code (`"D038"` → `"Isère"`), or the code if unknown.
+pub fn department_name(code: &str) -> &str {
+    let number = code.strip_prefix("D0").unwrap_or(code);
+    NAMES.iter().find(|n| n.0 == number).map_or(code, |n| n.1)
+}
+
+/// Metropolitan départements, by INSEE code.
+const NAMES: [(&str, &str); 96] = [
+    ("01", "Ain"),
+    ("02", "Aisne"),
+    ("03", "Allier"),
+    ("04", "Alpes-de-Haute-Provence"),
+    ("05", "Hautes-Alpes"),
+    ("06", "Alpes-Maritimes"),
+    ("07", "Ardèche"),
+    ("08", "Ardennes"),
+    ("09", "Ariège"),
+    ("10", "Aube"),
+    ("11", "Aude"),
+    ("12", "Aveyron"),
+    ("13", "Bouches-du-Rhône"),
+    ("14", "Calvados"),
+    ("15", "Cantal"),
+    ("16", "Charente"),
+    ("17", "Charente-Maritime"),
+    ("18", "Cher"),
+    ("19", "Corrèze"),
+    ("2A", "Corse-du-Sud"),
+    ("2B", "Haute-Corse"),
+    ("21", "Côte-d'Or"),
+    ("22", "Côtes-d'Armor"),
+    ("23", "Creuse"),
+    ("24", "Dordogne"),
+    ("25", "Doubs"),
+    ("26", "Drôme"),
+    ("27", "Eure"),
+    ("28", "Eure-et-Loir"),
+    ("29", "Finistère"),
+    ("30", "Gard"),
+    ("31", "Haute-Garonne"),
+    ("32", "Gers"),
+    ("33", "Gironde"),
+    ("34", "Hérault"),
+    ("35", "Ille-et-Vilaine"),
+    ("36", "Indre"),
+    ("37", "Indre-et-Loire"),
+    ("38", "Isère"),
+    ("39", "Jura"),
+    ("40", "Landes"),
+    ("41", "Loir-et-Cher"),
+    ("42", "Loire"),
+    ("43", "Haute-Loire"),
+    ("44", "Loire-Atlantique"),
+    ("45", "Loiret"),
+    ("46", "Lot"),
+    ("47", "Lot-et-Garonne"),
+    ("48", "Lozère"),
+    ("49", "Maine-et-Loire"),
+    ("50", "Manche"),
+    ("51", "Marne"),
+    ("52", "Haute-Marne"),
+    ("53", "Mayenne"),
+    ("54", "Meurthe-et-Moselle"),
+    ("55", "Meuse"),
+    ("56", "Morbihan"),
+    ("57", "Moselle"),
+    ("58", "Nièvre"),
+    ("59", "Nord"),
+    ("60", "Oise"),
+    ("61", "Orne"),
+    ("62", "Pas-de-Calais"),
+    ("63", "Puy-de-Dôme"),
+    ("64", "Pyrénées-Atlantiques"),
+    ("65", "Hautes-Pyrénées"),
+    ("66", "Pyrénées-Orientales"),
+    ("67", "Bas-Rhin"),
+    ("68", "Haut-Rhin"),
+    ("69", "Rhône"),
+    ("70", "Haute-Saône"),
+    ("71", "Saône-et-Loire"),
+    ("72", "Sarthe"),
+    ("73", "Savoie"),
+    ("74", "Haute-Savoie"),
+    ("75", "Paris"),
+    ("76", "Seine-Maritime"),
+    ("77", "Seine-et-Marne"),
+    ("78", "Yvelines"),
+    ("79", "Deux-Sèvres"),
+    ("80", "Somme"),
+    ("81", "Tarn"),
+    ("82", "Tarn-et-Garonne"),
+    ("83", "Var"),
+    ("84", "Vaucluse"),
+    ("85", "Vendée"),
+    ("86", "Vienne"),
+    ("87", "Haute-Vienne"),
+    ("88", "Vosges"),
+    ("89", "Yonne"),
+    ("90", "Territoire de Belfort"),
+    ("91", "Essonne"),
+    ("92", "Hauts-de-Seine"),
+    ("93", "Seine-Saint-Denis"),
+    ("94", "Val-de-Marne"),
+    ("95", "Val-d'Oise"),
+];
+
 /// Live service checks: `cargo test -- --ignored`.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_departements() {
+        assert_eq!(department_name("D038"), "Isère");
+        assert_eq!(department_name("D02A"), "Corse-du-Sud");
+        assert_eq!(department_name("D999"), "D999");
+    }
 
     #[test]
     #[ignore]
@@ -111,8 +219,7 @@ mod tests {
         // Two dalles west of Paris: only the second one is in the Paris archive.
         let codes = |x: f64, y: f64| -> Vec<String> {
             let rect = [x, y, x + 4995.0, y + 4995.0];
-            let deps = departments(&client().unwrap(), rect).unwrap();
-            deps.into_iter().map(|d| d.0).collect()
+            departments(&client().unwrap(), rect).unwrap()
         };
         assert_eq!(codes(640_000.0, 6_855_005.0), ["D078", "D092"]);
         assert_eq!(codes(640_000.0, 6_860_005.0), ["D075", "D092"]);

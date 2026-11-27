@@ -59,13 +59,13 @@ Vingt-six exigences décrivent la v1 hors couches. Les exigences sur les couches
 | VUE-2 | Écran partagé : carte et 3D côte à côte |
 | VUE-3 | En écran partagé, vues indépendantes : la carte reste nord en haut, la 3D s'oriente librement |
 | VUE-4 | Toute modification des couches sur la carte se répercute sur le bloc 3D ; les calques s'y appliquent du bas vers le haut, les toponymes en dernier |
-| VUE-5 | Bouton 3D grisé tant que le relief n'est pas téléchargé ou le cadre pas tracé, avec une infobulle qui dit ce qui manque |
+| VUE-5 | Trois boutons toujours actifs : Carte, 3D, Côte à côte. Sans bloc, la vue 3D reste vide, et une infobulle dit ce qui manque ; le bloc se construit dès qu'une vue le montre, le cadre tracé et son relief installé |
 | ZON-1 | Recherche de lieu avec autocomplétion (service Géoplateforme) ; la carte se centre sur le lieu choisi, au niveau de zoom 15 (\~5 km de large) |
 | ZON-2 | Cadre rectangulaire tracé et modifié uniquement sur la carte, côté ≤ 10 km, dimensions affichées |
 | TEL-1 | Une fois le cadre tracé, proposition de télécharger le relief RGE ALTI 5 m des seuls départements nécessaires au cadre, taille annoncée ; un seul bouton « Télécharger », sans case à cocher ni bouton « Plus tard » ; la proposition s'affiche immédiatement, la taille suit dès qu'elle est connue |
 | TEL-2 | Cadre à cheval sur plusieurs départements : on propose le plus petit ensemble d'archives qui couvre le cadre. Une archive contient toutes les dalles de 5 km qui touchent son département ; un département voisin n'est proposé que si une dalle du cadre ne touche aucun département déjà retenu ou installé (ex. Clécy : le Calvados suffit) |
 | TEL-3 | Progression, pause et reprise du téléchargement ; décompression et conversion automatiques |
-| STO-1 | Écran de gestion : départements et zones téléchargés, taille, suppression, dossier de stockage au choix |
+| STO-1 | Menu Options : relief de chaque département téléchargé, Plan IGN gardé pour la France (niveaux 0 à 10) et cache des tuiles, avec leur taille et leur suppression ; taille du cache réglable. Reporté : dossier de stockage au choix |
 | GEN-1 | Bloc 3D à 5 m, pleine résolution, construit depuis les données locales |
 | GEN-2 | Socle fermé (faces latérales et dessous) |
 | GEN-3 | Bâtiments en 3D, toujours affichés : chaque bâtiment du Plan IGN est extrudé à sa hauteur réelle (non exagérée), posé sur le relief, en gris clair uni. L'eau en coupe sur les faces latérales a été essayée puis écartée : rendu peu convaincant, et pas de profondeur des lacs disponible |
@@ -78,7 +78,7 @@ Vingt-six exigences décrivent la v1 hors couches. Les exigences sur les couches
 | EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 (défaut), 3 840, 5 760 ou 7 680 px sur le plus grand côté, dans la limite du GPU |
 | EXP-2 | Crédits des sources incrustés sur l'image (ex. « Source : IGN – Licence Ouverte ») |
 | EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages), cadré sur le bloc entier quels que soient le zoom et le déplacement à l'écran |
-| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo), les moins récemment vues effacées en premier. Les tuiles drapées sur un bloc y restent aussi : pas de téléchargement des calques à part |
+| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo par défaut, de 100 Mo à 5 Go dans les options), les moins récemment vues effacées en premier. Les tuiles drapées sur un bloc y restent aussi : pas de téléchargement des calques à part |
 | CAR-2 | Les niveaux 0 à 10 du Plan IGN vectoriel sur la France métropolitaine (\~95 Mo, dont 89 Mo pour le niveau 10) sont téléchargés une fois, en tâche de fond : vues d'ensemble immédiates et disponibles hors connexion |
 | CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide ; fond de carte blanc. Plan IGN dessiné en tuiles de 512 px, comme le prévoit son style : détails et toponymes apparaissent un niveau de zoom plus tard, pour une carte moins chargée |
 

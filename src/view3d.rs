@@ -533,7 +533,10 @@ impl View3d {
         } else {
             (size * aspect, size)
         };
-        let (width, height) = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
+        let (width, height) = (
+            width.round().max(1.0) as u32,
+            height.round().max(1.0) as u32,
+        );
         let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
         let renderer = rs.renderer.read();
         let gpu: &Gpu = renderer.callback_resources.get().expect("bloc chargé");

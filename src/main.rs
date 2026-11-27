@@ -42,8 +42,8 @@ const EXPORT_WIDTHS: [u32; 5] = [1280, 1920, 3840, 5760, 7680];
 enum Msg {
     Status(String),
     Places(String, Vec<Place>),
-    /// For a frame: département names met, and the codes to download.
-    Departments(Frame, HashMap<String, String>, Vec<String>),
+    /// For a frame: the départements to download.
+    Departments(Frame, Vec<String>),
     /// Archive size of a département, in bytes.
     Size(String, u64),
     Progress(String, Progress),
@@ -58,6 +58,24 @@ enum Msg {
     Buildings(Frame, buildings::Mesh),
     /// How the image export ended.
     Exported(String),
+    /// What the downloaded data takes on disk.
+    Storage(Storage),
+}
+
+/// Disk space, in bytes, shown in the options: relief per département, seeded and cached tiles.
+struct Storage {
+    reliefs: Vec<(u64, String)>,
+    seed: u64,
+    cache: u64,
+}
+
+/// What the main area shows.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Map,
+    Block,
+    /// Map and block side by side.
+    Split,
 }
 
 /// One layer of the stack, with its map tiles.
@@ -98,6 +116,8 @@ struct Download {
     running: bool,
     text: String,
     fraction: f32,
+    /// Tiles being converted after the download: too short to pause.
+    converting: bool,
 }
 
 struct Blocs {
@@ -122,7 +142,6 @@ struct Blocs {
     places: Vec<Place>,
 
     installed: Vec<String>,
-    names: HashMap<String, String>,
     sizes: HashMap<String, u64>,
     in_frame: Lookup,
     download: Download,
@@ -130,14 +149,20 @@ struct Blocs {
     view3d: Option<View3d>,
     built: Option<Frame>,
     building: bool,
+    /// Frame last built, or tried: not built again until its relief changes.
+    tried: Option<Frame>,
     /// Layers whose image is on the block, and those being prepared.
     draped: HashSet<&'static str>,
     draping: HashSet<&'static str>,
-    show_3d: bool,
+    view: View,
     export_width: u32,
     /// An export is being saved; then how the last one ended.
     exporting: bool,
     export_note: String,
+    /// `None` while measuring.
+    storage: Option<Storage>,
+    /// Cache limit set in the options, in MB.
+    cache_mb: u32,
 }
 
 impl Blocs {
@@ -201,7 +226,6 @@ impl Blocs {
             search_typed: None,
             places: Vec::new(),
             installed: relief::installed(),
-            names: HashMap::new(),
             sizes: HashMap::new(),
             in_frame: Lookup::default(),
             download: Download {
@@ -210,16 +234,20 @@ impl Blocs {
                 running: false,
                 text: String::new(),
                 fraction: 0.0,
+                converting: false,
             },
             view3d: None,
             built: None,
             building: false,
+            tried: None,
             draped: HashSet::new(),
             draping: HashSet::new(),
-            show_3d: false,
+            view: View::Map,
             export_width: EXPORT_WIDTHS[1],
             exporting: false,
             export_note: String::new(),
+            storage: None,
+            cache_mb: (tiles::cache_limit() / 1_000_000) as u32,
         }
     }
 
@@ -238,6 +266,15 @@ impl Blocs {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Status(text) => self.status = text,
+                Msg::Storage(storage) => {
+                    // A relief was deleted: look the frame's départements up again.
+                    let deps: Vec<_> = storage.reliefs.iter().map(|r| r.1.clone()).collect();
+                    if deps != self.installed {
+                        self.installed = deps;
+                        self.in_frame = Lookup::default();
+                    }
+                    self.storage = Some(storage);
+                }
                 Msg::Exported(note) => {
                     self.exporting = false;
                     self.export_note = note;
@@ -247,8 +284,7 @@ impl Blocs {
                         self.places = places;
                     }
                 }
-                Msg::Departments(frame, names, codes) => {
-                    self.names.extend(names);
+                Msg::Departments(frame, codes) => {
                     if self.in_frame.frame == Some(frame) {
                         self.in_frame.codes = Some(codes);
                     }
@@ -257,7 +293,8 @@ impl Blocs {
                     self.sizes.insert(code, size);
                 }
                 Msg::Progress(dep, p) => {
-                    let name = self.name(&dep);
+                    let name = ign::department_name(&dep);
+                    self.download.converting = matches!(p, Progress::Convert { .. });
                     (self.download.text, self.download.fraction) = match p {
                         Progress::Download { done, total } => (
                             format!(
@@ -274,10 +311,15 @@ impl Blocs {
                     };
                 }
                 Msg::Installed(dep) => {
-                    self.status = format!("Relief installé : {}.", self.name(&dep));
+                    self.status = format!("Relief installé : {}.", ign::department_name(&dep));
                     self.download.queue.retain(|d| *d != dep);
                     self.download.running = false;
                     self.installed = relief::installed();
+                    self.tried = None;
+                    // The options menu, if open, lists it.
+                    if self.storage.is_some() {
+                        self.measure(|| ());
+                    }
                     self.next_download();
                 }
                 Msg::Stopped(error) => {
@@ -340,7 +382,6 @@ impl Blocs {
                                 start.elapsed().as_secs_f64()
                             );
                             self.built = Some(built);
-                            self.show_3d = true;
                         }
                         Err(e) => self.status = format!("Échec : {e}"),
                     }
@@ -349,22 +390,20 @@ impl Blocs {
         }
     }
 
-    fn name(&self, dep: &str) -> String {
-        self.names
-            .get(dep)
-            .cloned()
-            .unwrap_or_else(|| dep.to_owned())
-    }
-
     /// Finds the départements to download for `frame`, then their archive sizes.
     fn look_up(&self, frame: Frame) {
         let installed = self.installed.clone();
         let known: HashSet<String> = self.sizes.keys().cloned().collect();
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.spawn(move |send| {
+            // Offline, nothing to offer: the block is built from what is installed.
+            let fail = |text: String| {
+                send(Msg::Status(text));
+                send(Msg::Departments(frame, Vec::new()));
+            };
             let http = match ign::client() {
                 Ok(http) => http,
-                Err(e) => return send(Msg::Status(format!("Réseau indisponible : {e}"))),
+                Err(e) => return fail(format!("Réseau indisponible : {e}")),
             };
             // Which départements touch each dalle of the frame, asked in parallel.
             let dalles = relief::dalles([frame.x0, frame.y0, frame.x1, frame.y1]);
@@ -380,15 +419,10 @@ impl Blocs {
             });
             let answers = match answers.into_iter().collect::<relief::Result<Vec<_>>>() {
                 Ok(answers) => answers,
-                Err(e) => return send(Msg::Status(format!("Départements introuvables : {e}"))),
+                Err(e) => return fail(format!("Départements introuvables : {e}")),
             };
-            let names: HashMap<_, _> = answers.iter().flatten().cloned().collect();
-            let per_dalle: Vec<Vec<String>> = answers
-                .iter()
-                .map(|deps| deps.iter().map(|d| d.0.clone()).collect())
-                .collect();
-            let needed = relief::cover(&per_dalle, &installed);
-            send(Msg::Departments(frame, names, needed.clone()));
+            let needed = relief::cover(&answers, &installed);
+            send(Msg::Departments(frame, needed.clone()));
 
             // Sizes arrive one by one, so the offer shows without waiting for them.
             for dep in needed.into_iter().filter(|d| !known.contains(d)) {
@@ -450,21 +484,25 @@ impl Blocs {
         if self.frame.is_none() {
             return Some("Tracez d'abord un cadre sur la carte.".into());
         }
-        let codes = self.in_frame.codes.as_ref()?;
+        // The block waits for the frame's départements, so as not to build it without them.
+        let Some(codes) = &self.in_frame.codes else {
+            return Some("Recherche des départements du cadre…".into());
+        };
         let missing: Vec<_> = codes
             .iter()
             .filter(|c| !self.installed.contains(c))
-            .map(|c| self.name(c))
+            .map(|c| ign::department_name(c))
             .collect();
         (!missing.is_empty())
             .then(|| format!("Téléchargez d'abord le relief : {}.", missing.join(", ")))
     }
 
-    fn open_3d(&mut self) {
+    /// Builds the frame's block, once drawn and its relief installed, while a view shows it.
+    fn build_if_ready(&mut self) {
         let Some(frame) = self.frame else { return };
-        if self.built == Some(frame) {
-            self.show_3d = true;
-        } else if !self.building {
+        let ready = self.edit.is_none() && self.missing_3d().is_none();
+        if self.view != View::Map && ready && !self.building && self.tried != Some(frame) {
+            self.tried = Some(frame);
             self.building = true;
             self.status = "Construction du bloc…".into();
             self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
@@ -582,17 +620,16 @@ impl Blocs {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.show_3d, false, "Carte");
+            ui.selectable_value(&mut self.view, View::Map, "Carte");
+            // Without a block, these show an empty view; the tip says what is missing.
             let missing = self.missing_3d();
-            let button = ui
-                .add_enabled(
-                    missing.is_none(),
-                    egui::Button::selectable(self.show_3d, "3D"),
-                )
-                .on_disabled_hover_text(missing.unwrap_or_default());
-            if button.clicked() {
-                self.open_3d();
+            for (view, text) in [(View::Block, "3D"), (View::Split, "Côte à côte")] {
+                let button = ui.selectable_value(&mut self.view, view, text);
+                if let Some(missing) = &missing {
+                    button.on_hover_text(missing);
+                }
             }
+            self.options(ui);
             ui.separator();
 
             let search = ui.add(
@@ -609,7 +646,7 @@ impl Blocs {
             }
             self.search_results(ui, &search);
 
-            if !self.show_3d {
+            if self.view != View::Block {
                 ui.separator();
                 ui.toggle_value(&mut self.drawing, "Tracer le cadre")
                     .on_hover_text(
@@ -683,6 +720,38 @@ impl Blocs {
         self.places.clear();
     }
 
+    /// The relief download in progress, with its pause button; `bar`: as a progress bar.
+    fn download_progress(&mut self, ui: &mut egui::Ui, bar: bool) {
+        ui.horizontal(|ui| {
+            let paused = !self.download.running;
+            // No pause while converting; a failed conversion can still be resumed.
+            let pausable = paused || !self.download.converting;
+            if pausable
+                && ui
+                    .button(if paused { "Reprendre" } else { "Pause" })
+                    .clicked()
+            {
+                if paused {
+                    self.next_download();
+                } else {
+                    self.download.pause.store(true, Ordering::Relaxed);
+                }
+            }
+            let mut text = self.download.text.clone();
+            if self.download.queue.len() > 1 {
+                text += &format!(" · {} en attente", self.download.queue.len() - 1);
+            }
+            if paused {
+                text += " · en pause";
+            }
+            if bar {
+                ui.add(egui::ProgressBar::new(self.download.fraction).text(text));
+            } else {
+                ui.label(text);
+            }
+        });
+    }
+
     /// Offer to download the relief, or show the download in progress.
     fn download_bar(&mut self, ui: &mut egui::Ui) {
         let proposal = self.proposal();
@@ -692,31 +761,11 @@ impl Blocs {
         }
         egui::Panel::bottom("téléchargement").show(ui, |ui| {
             if !self.download.queue.is_empty() {
-                ui.horizontal(|ui| {
-                    let paused = !self.download.running;
-                    if ui
-                        .button(if paused { "Reprendre" } else { "Pause" })
-                        .clicked()
-                    {
-                        if paused {
-                            self.next_download();
-                        } else {
-                            self.download.pause.store(true, Ordering::Relaxed);
-                        }
-                    }
-                    let mut text = self.download.text.clone();
-                    if self.download.queue.len() > 1 {
-                        text += &format!(" · {} en attente", self.download.queue.len() - 1);
-                    }
-                    if paused {
-                        text += " · en pause";
-                    }
-                    ui.add(egui::ProgressBar::new(self.download.fraction).text(text));
-                });
+                self.download_progress(ui, true);
             }
             if offer {
                 ui.horizontal(|ui| {
-                    let names: Vec<_> = proposal.iter().map(|d| self.name(d)).collect();
+                    let names: Vec<_> = proposal.iter().map(|d| ign::department_name(d)).collect();
                     ui.label(format!("Relief à télécharger : {}", names.join(", ")));
                     // The total shows once every size is known.
                     let sizes: Option<Vec<u64>> = proposal
@@ -734,6 +783,110 @@ impl Blocs {
                 });
             }
         });
+    }
+
+    /// The options menu: downloaded data, its disk space, and what to delete.
+    fn options(&mut self, ui: &mut egui::Ui) {
+        use egui::containers::menu::{MenuButton, MenuConfig};
+        // Stays open while deleting or sliding; a click elsewhere closes it.
+        let config =
+            MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        let (button, _) = MenuButton::new("Options")
+            .config(config)
+            .ui(ui, |ui| self.options_menu(ui));
+        if button.clicked() {
+            self.measure(|| ());
+        }
+    }
+
+    /// Runs `job` on a thread, then measures the disk space again.
+    fn measure(&mut self, job: impl FnOnce() + Send + 'static) {
+        self.storage = None;
+        self.spawn(move |send| {
+            job();
+            let reliefs = relief::installed().into_iter();
+            send(Msg::Storage(Storage {
+                reliefs: reliefs.map(|d| (relief::disk_use(&d), d)).collect(),
+                seed: tiles::disk_use(true),
+                cache: tiles::disk_use(false),
+            }))
+        });
+    }
+
+    fn options_menu(&mut self, ui: &mut egui::Ui) {
+        // A fixed width, which the département list fills, its scroll bar on the edge.
+        ui.set_width(360.0);
+        if !self.download.queue.is_empty() {
+            ui.strong("Relief en téléchargement");
+            self.download_progress(ui, false);
+            ui.separator();
+        }
+        let Some(storage) = &self.storage else {
+            ui.spinner();
+            return;
+        };
+        let (seed, cache) = (storage.seed, storage.cache);
+        // What a click asks for, run after the menu is drawn.
+        let mut job: Option<Box<dyn FnOnce() + Send>> = None;
+
+        ui.strong("Relief téléchargé");
+        if storage.reliefs.is_empty() {
+            ui.label("Aucun département.");
+        }
+        // Past 10 départements, the list scrolls rather than lengthening the menu.
+        let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(10.0 * row)
+            .show(ui, |ui| {
+                for (size, dep) in &storage.reliefs {
+                    ui.horizontal(|ui| {
+                        // Not while it downloads.
+                        let idle = !self.download.queue.contains(dep);
+                        if confirmed(ui, dep, idle) {
+                            let dir = relief::department_dir(dep);
+                            job = Some(Box::new(move || drop(std::fs::remove_dir_all(dir))));
+                        }
+                        ui.label(format!(
+                            "{} · {}",
+                            ign::department_name(dep),
+                            megabytes(*size)
+                        ));
+                    });
+                }
+            });
+        ui.separator();
+
+        ui.strong("Plan IGN de la France");
+        ui.horizontal(|ui| {
+            if confirmed(ui, "plan", true) {
+                job = Some(Box::new(|| tiles::delete(true)));
+            }
+            ui.label(format!("{} · téléchargé au lancement", megabytes(seed)));
+        });
+        ui.separator();
+
+        ui.strong("Cache des tuiles");
+        ui.horizontal(|ui| {
+            if confirmed(ui, "cache", true) {
+                job = Some(Box::new(|| tiles::delete(false)));
+            }
+            ui.label(megabytes(cache));
+        });
+        let slider = ui.add(
+            egui::Slider::new(&mut self.cache_mb, 100..=5000)
+                .logarithmic(true)
+                .suffix(" Mo")
+                .text("au plus"),
+        );
+        // Saved once the handle is let go, which trims the cache if needed.
+        if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+            let bytes = self.cache_mb as u64 * 1_000_000;
+            job = Some(Box::new(move || tiles::set_cache_limit(bytes)));
+        }
+        if let Some(job) = job {
+            self.measure(job);
+        }
     }
 
     /// The layers, top first, each shown or hidden, with its opacity. Their order is
@@ -769,11 +922,19 @@ impl Blocs {
             });
             ui.separator();
         }
-        let Some(view) = &mut self.view3d else { return };
-        ui.label("Étirement du relief");
-        ui.add(egui::Slider::new(&mut view.exaggeration, 1.0..=2.0).prefix("×"));
-        ui.label("Profondeur du socle");
-        ui.add(egui::Slider::new(&mut view.base_depth, 50.0..=1000.0).suffix(" m"));
+        // Without a block, the same controls, greyed out on placeholder values.
+        let block = self.view3d.is_some();
+        let mut none = (1.5, 300.0);
+        let (exaggeration, base_depth) = match &mut self.view3d {
+            Some(view) => (&mut view.exaggeration, &mut view.base_depth),
+            None => (&mut none.0, &mut none.1),
+        };
+        ui.add_enabled_ui(block, |ui| {
+            ui.label("Étirement du relief");
+            ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
+            ui.label("Profondeur du socle");
+            ui.add(egui::Slider::new(base_depth, 50.0..=1000.0).suffix(" m"));
+        });
         ui.separator();
         ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil");
         ui.separator();
@@ -786,7 +947,7 @@ impl Blocs {
                 }
             });
         if ui
-            .add_enabled(!self.exporting, egui::Button::new("Exporter…"))
+            .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
             .clicked()
         {
             self.export(frame);
@@ -809,19 +970,42 @@ impl eframe::App for Blocs {
         self.drape_visible(frame.wgpu_render_state());
 
         egui::Panel::top("barre").show(ui, |ui| self.top_bar(ui));
-
-        if self.show_3d && self.view3d.is_some() {
+        self.build_if_ready();
+        if self.view != View::Map {
             egui::Panel::right("réglages").show(ui, |ui| self.settings_3d(ui, frame));
-            let stack = self.stack();
-            if let (Some(view), Some(rs)) = (&mut self.view3d, frame.wgpu_render_state()) {
-                view.set_stack(rs, &stack);
-                view.ui(ui, rs);
-            }
-            return;
         }
-
-        egui::Panel::left("calques").show(ui, |ui| self.layers_panel(ui));
+        if self.view != View::Block {
+            egui::Panel::left("calques").show(ui, |ui| self.layers_panel(ui));
+        }
         self.download_bar(ui);
+        match self.view {
+            View::Map => self.map_view(ui),
+            View::Block => self.block_view(ui, frame),
+            View::Split => {
+                // The map on the left, its edge dragged to share the width with the block.
+                let width = ui.available_width();
+                egui::Panel::left("carte")
+                    .frame(egui::Frame::NONE)
+                    .default_size(width / 2.0)
+                    .size_range(200.0..=(width - 200.0).max(200.0))
+                    .show(ui, |ui| self.map_view(ui));
+                self.block_view(ui, frame);
+            }
+        }
+    }
+}
+
+impl Blocs {
+    /// The block, or nothing until there is one.
+    fn block_view(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let stack = self.stack();
+        if let (Some(view), Some(rs)) = (&mut self.view3d, frame.wgpu_render_state()) {
+            view.set_stack(rs, &stack);
+            view.ui(ui, rs);
+        }
+    }
+
+    fn map_view(&mut self, ui: &mut egui::Ui) {
         // Shift + wheel pans east-west, Ctrl + wheel north-south; the plain wheel zooms.
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         let modifiers = ui.input(|i| i.modifiers);
@@ -887,6 +1071,17 @@ impl eframe::App for Blocs {
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// A "Supprimer" button that asks "Confirmer" on the first click; leaving it disarms it.
+fn confirmed(ui: &mut egui::Ui, salt: impl egui::AsIdSalt, enabled: bool) -> bool {
+    let id = ui.scope_id().with(salt);
+    let armed = ui.data(|d| d.get_temp(id)).unwrap_or(false);
+    let label = if armed { "Confirmer" } else { "Supprimer" };
+    let response = ui.add_enabled(enabled, egui::Button::new(label));
+    let clicked = response.clicked();
+    ui.data_mut(|d| d.insert_temp(id, response.hovered() && (armed != clicked)));
+    armed && clicked
 }
 
 fn megabytes(bytes: u64) -> String {
