@@ -36,7 +36,7 @@ const SURFACE: u32 = 0u;
 const WALL_TOP: u32 = 1u;
 const WALL_BOTTOM: u32 = 2u;
 const FLOOR: u32 = 3u;
-// Light grey of the buildings, also the base's walls and floor.
+// Light grey of the buildings, the base's walls and floor, and the bare relief.
 const GREY: vec3<f32> = vec3(0.88);
 
 struct Out {
@@ -62,17 +62,6 @@ fn height(i: i32, j: i32) -> f32 {
     return textureLoad(heights, clamp(vec2(i, j), vec2(0), n - 1), 0).r;
 }
 
-// Hypsometric tint by absolute altitude.
-fn tint(h: f32) -> vec3<f32> {
-    let low = vec3(0.45, 0.58, 0.35);
-    let mid = vec3(0.72, 0.66, 0.48);
-    let high = vec3(0.55, 0.50, 0.46);
-    let snow = vec3(0.95, 0.95, 0.97);
-    if h < 1000.0 { return mix(low, mid, h / 1000.0); }
-    if h < 2200.0 { return mix(mid, high, (h - 1000.0) / 1200.0); }
-    return mix(high, snow, clamp((h - 2200.0) / 800.0, 0.0, 1.0));
-}
-
 @vertex
 fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> Out {
     let exag = u.params.x;
@@ -91,7 +80,8 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
             let dx = (height(i + 1, j) - height(i - 1, j)) * exag / (2.0 * cell);
             let dz = (height(i, j - 1) - height(i, j + 1)) * exag / (2.0 * cell);
             out.normal = normalize(vec3(-dx, 1.0, -dz));
-            out.color = tint(h);
+            // Grey under the layers, as the map is plain under a see-through photo.
+            out.color = GREY;
             out.surface = 1.0;
             out.shaded = 1.0;
         }
