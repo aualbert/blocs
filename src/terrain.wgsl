@@ -2,7 +2,7 @@
 
 struct Uniforms {
     view_proj: mat4x4<f32>,
-    params: vec4<f32>, // exaggeration, base depth (m), cell (m), unused
+    params: vec4<f32>, // exaggeration, base depth (m), cell (m), line width (px)
     grid: vec4<f32>,   // points east, points north, min height, max height (m)
     sun: vec4<f32>,    // direction towards the sun
     opacity: array<vec4<f32>, 3>, // per layer slot (SLOTS), bottom first
@@ -46,6 +46,9 @@ struct Out {
     // 1 where the relief's shadows fall (surface, buildings); 0 on the block's walls
     // and floor, whose sunny sides face away from the relief.
     @location(5) shaded: f32,
+    // On the walls: the relief's profile above (height, as `world.y`), the distance to the
+    // wall's nearer end (m), and 1; zero elsewhere. For the block diagram's lines.
+    @location(6) edge: vec4<f32>,
 };
 
 fn height(i: i32, j: i32) -> f32 {
@@ -92,6 +95,11 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
             out.color = GREY;
         }
         default: {
+            // Along the wall, from its west or south end.
+            let west_east = kind_side.y < 2u;
+            let along = select(f32(i), f32(j), west_east) * cell;
+            let length = (select(u.grid.x, u.grid.y, west_east) - 1.0) * cell;
+            out.edge = vec4(p.y, min(along, length - along), 0.0, 1.0);
             if kind_side.x == WALL_BOTTOM { p.y = -u.params.y; }
             let sides = array(vec3(-1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0));
             out.normal = sides[kind_side.y];
@@ -155,9 +163,22 @@ fn sunlit(p: vec3<f32>) -> f32 {
         + textureSampleLevel(shadows, samp, uv + vec2(d.x, d.y), 0.0).r);
 }
 
+// Ink of the block diagram's lines on the walls: under the relief's profile, along the
+// bottom, and at the corners, `u.params.w` pixels wide whatever the zoom.
+fn ink(in: Out) -> f32 {
+    // Distances from the profile, the bottom and the nearer end, in metres, then pixels.
+    let d = vec3(in.edge.x - in.world.y, in.world.y + u.params.y, in.edge.y);
+    let px = d / max(fwidth(d), vec3(1e-6));
+    let nearest = min(px.x, min(px.y, px.z));
+    return (1.0 - smoothstep(u.params.w - 1.0, u.params.w, nearest)) * in.edge.w;
+}
+
 @fragment
 fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // Every slot is sampled (empty ones are transparent), keeping control flow uniform.
+    let line = ink(in);
+    // The walls darken a little towards the bottom, as on a drawn block.
+    let down = clamp((in.edge.x - in.world.y) / (in.edge.x + u.params.y), 0.0, 1.0) * in.edge.w;
     var c = in.color;
     c = over(c, textureSample(layer0, samp, in.uv), u.opacity[0].x);
     c = over(c, textureSample(layer1, samp, in.uv), u.opacity[0].y);
@@ -173,5 +194,7 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // The 3D light shades the layers; none of them carries baked shading.
     let direct = max(dot(normalize(in.normal), u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
     let light = 0.35 + 0.65 * direct;
-    return vec4(color * light, 1.0);
+    let lit = color * light * (1.0 - 0.2 * down);
+    // Light ink: a faint line, as in pencil.
+    return vec4(mix(lit, vec3(0.2), 0.15 * line), 1.0);
 }

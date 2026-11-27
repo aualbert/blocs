@@ -27,6 +27,9 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 pub const SLOTS: usize = 9;
 /// Depths offered for the base, in metres.
 pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 1.0..=999.0;
+/// Width of the block-diagram lines on its walls, in points on screen. An export scales it
+/// with its size, as on a view about 1200 points wide.
+const LINE: f32 = 1.5;
 /// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
 const SAMPLES: u32 = 4;
 
@@ -326,7 +329,7 @@ impl View3d {
         let size = [size.x.max(1.0) as u32, size.y.max(1.0) as u32];
         let target = self.screen_target(rs, size);
         let callback = Draw {
-            uniforms: self.uniforms(aspect),
+            uniforms: self.uniforms(aspect, LINE * ui.pixels_per_point()),
             target,
         };
         ui.painter()
@@ -478,9 +481,10 @@ impl View3d {
     }
 
     /// The on-screen window: `zoom` high, around the point looked at.
-    fn uniforms(&self, aspect: f32) -> Uniforms {
+    /// `line`: width of the walls' lines, in pixels.
+    fn uniforms(&self, aspect: f32, line: f32) -> Uniforms {
         let (h, w) = (self.zoom, self.zoom * aspect);
-        self.uniforms_in([-w, w, -h, h])
+        self.uniforms_in([-w, w, -h, h], line)
     }
 
     /// Point looked at (the middle of the relief) and the block's diagonal.
@@ -520,7 +524,7 @@ impl View3d {
         [win[0] - m, win[1] + m, win[2] - m, win[3] + m]
     }
 
-    fn uniforms_in(&self, [l, r, b, t]: [f32; 4]) -> Uniforms {
+    fn uniforms_in(&self, [l, r, b, t]: [f32; 4], line: f32) -> Uniforms {
         let (dir, _, up) = self.basis();
         // The camera stands outside the whole block.
         let (target, radius) = self.framing();
@@ -531,7 +535,7 @@ impl View3d {
         let sun = self.to_block(self.sun.dir());
         Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
-            params: [self.exaggeration, self.base_depth, CELL as f32, 0.0],
+            params: [self.exaggeration, self.base_depth, CELL as f32, line],
             grid: [
                 self.points.0 as f32,
                 self.points.1 as f32,
@@ -565,12 +569,13 @@ impl View3d {
             height.round().max(1.0) as u32,
         );
         let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
+        let line = (width.max(height) as f32 / 1200.0 * LINE).max(LINE);
         let renderer = rs.renderer.read();
         let gpu: &Gpu = renderer.callback_resources.get().expect("bloc chargé");
         queue.write_buffer(
             &gpu.uniforms,
             0,
-            bytemuck::bytes_of(&self.uniforms_in(window)),
+            bytemuck::bytes_of(&self.uniforms_in(window, line)),
         );
         let mut encoder = device.create_command_encoder(&Default::default());
         gpu.render(&mut encoder, &target);
