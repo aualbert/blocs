@@ -1,3 +1,6 @@
+// On Windows, no console window behind the app (release builds only).
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // First, so that its `tr!` macro reaches every module.
 #[macro_use]
 mod i18n;

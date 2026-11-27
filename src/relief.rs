@@ -42,8 +42,11 @@ pub enum Progress {
     Convert { done: usize, total: usize },
 }
 
+/// The app's data: `~/.local/share/blocs` on Linux, `~/Library/Application Support/blocs`
+/// on macOS, `%LOCALAPPDATA%\blocs` on Windows. Local rather than roaming on Windows:
+/// gigabytes of relief and tiles must not follow the user across a network.
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| ".".into()).join("blocs")
+    dirs::data_local_dir().unwrap_or_else(|| ".".into()).join("blocs")
 }
 
 /// Where a département's converted tiles live.
@@ -241,7 +244,16 @@ pub fn convert(archive: &Path, out: &Path, mut progress: impl FnMut(Progress)) -
     if out.exists() {
         fs::remove_dir_all(out)?;
     }
-    fs::rename(&tmp, out)?;
+    // On Windows, an antivirus may hold the fresh files a moment: try again rather than
+    // lose the archive, deleted after a failed conversion.
+    let mut tries = 0;
+    while let Err(e) = fs::rename(&tmp, out) {
+        tries += 1;
+        if tries == 10 {
+            return Err(e.into());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
     Ok(())
 }
 

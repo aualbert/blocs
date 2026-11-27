@@ -1,0 +1,64 @@
+# On each published release: tests and builds Blocs on Windows and on Apple Silicon Macs,
+# then attaches them to the release.
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # to attach the builds
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: blocs-windows-x86_64.exe
+          - os: macos-latest # Apple Silicon
+            asset: blocs-macos-arm64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked
+
+      - if: runner.os == 'Windows'
+        shell: bash
+        run: cp target/release/blocs.exe ${{ matrix.asset }}
+
+      # A zipped app rather than a bare binary: opened from the Finder without a Terminal,
+      # named Blocs, and still executable once downloaded. Signed ad hoc, as a whole, since
+      # an unsigned app reads as damaged on Apple Silicon.
+      - if: runner.os == 'macOS'
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          mkdir -p Blocs.app/Contents/MacOS
+          cp target/release/blocs Blocs.app/Contents/MacOS/
+          cat > Blocs.app/Contents/Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Blocs</string>
+            <key>CFBundleExecutable</key><string>blocs</string>
+            <key>CFBundleIdentifier</key><string>io.github.aualbert.blocs</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION#v}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - Blocs.app
+          ditto -c -k --keepParent Blocs.app ${{ matrix.asset }}
+
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload ${{ github.event.release.tag_name }} ${{ matrix.asset }} --clobber
