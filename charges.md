@@ -10,7 +10,7 @@ Les données existent (relief, photos aériennes, cartes, hydrographie) mais les
 
 Objectifs mesurables :
 
-- Obtenir un premier bloc en 4 actions : zoomer, tracer le cadre, accepter le téléchargement du relief, passer en 3D.
+- Obtenir un premier bloc en 3 actions : zoomer, tracer le cadre, accepter le téléchargement du relief ; le bloc s'ouvre de lui-même à côté de la carte.
 - Passer de la carte à la 3D en un clic, ou afficher les deux côte à côte.
 - Composer le rendu avec les couches de la carte, appliquées sur le terrain en 3D.
 - Fonctionner hors connexion une fois les données téléchargées.
@@ -45,50 +45,52 @@ Le parcours nominal tient en huit étapes ; le téléchargement (étape 4) n'a l
 3. Il trace un cadre rectangulaire ; ses dimensions s'affichent en km et le cadre ne dépasse pas 10 km.
 4. Si le relief manque, l'app propose aussitôt de télécharger le ou les départements nécessaires au cadre, avec la taille totale ; il accepte d'un clic.
 5. Il affiche, masque ou atténue les calques sur la carte.
-6. Il passe en vue 3D en un clic, ou affiche carte et 3D côte à côte ; le bloc apparaît avec les couches appliquées sur le terrain.
-7. En 3D, il oriente le bloc à la souris ou avec le widget d'axes, règle le soleil et, sur le curseur vertical, l'étirement du relief et la profondeur du socle.
+6. Dès que le relief du cadre est installé, le bloc se construit et s'affiche à côté de la carte, avec les couches appliquées sur le terrain ; il glisse le séparateur pour ne garder qu'une vue.
+7. En 3D, il oriente le bloc à la souris ou avec le widget d'axes, règle le soleil et, dans la carte Bloc, l'étirement du relief et la profondeur du socle.
 8. Il exporte une image PNG à fond transparent, sources citées automatiquement.
 
 ## Exigences fonctionnelles
 
-Vingt-six exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
+Vingt-huit exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
 
 | ID | Exigence |
 | --- | --- |
-| VUE-1 | Deux vues, Carte et 3D, bascule en un clic |
-| VUE-2 | Écran partagé : carte et 3D côte à côte |
+| VUE-1 | Deux vues, Carte et 3D ; quand une seule est montrée, un bouton bascule sur l'autre |
+| VUE-2 | Écran partagé : carte à gauche, 3D à droite, séparées par un trait que l'on glisse ; glissé à moins de 100 points d'un bord, il s'y aimante et, relâché, ne laisse que l'autre vue ; un bouton « Vue double » revient au partage, moitié-moitié |
 | VUE-3 | En écran partagé, vues indépendantes : la carte reste nord en haut, la 3D s'oriente librement |
 | VUE-4 | Toute modification des couches sur la carte se répercute sur le bloc 3D ; les calques s'y appliquent du bas vers le haut, les toponymes en dernier |
-| VUE-5 | Trois boutons toujours actifs : Carte, 3D, Côte à côte. Sans bloc, la vue 3D reste vide, et une infobulle dit ce qui manque ; le bloc se construit dès qu'une vue le montre, le cadre tracé et son relief installé |
+| VUE-5 | Pas de boutons de vue : la carte seule tant qu'il n'y a pas de bloc. Le bloc se construit dès que le cadre est tracé et son relief installé, y compris à la fin d'un téléchargement en cours, quelle que soit la vue ; une fois construit, l'écran partagé s'ouvre |
+| IHM-1 | Pas de panneaux : les vues occupent toute la fenêtre, les commandes flottent dessus sur de petites cartes, le long du bord gauche. En haut, la barre : recherche, « Tracer le cadre » (grisé en 3D seule), Options ; à sa droite, si une seule vue est montrée et le bloc chargé, les boutons de vue. Dessous, la carte Calques, toujours présente, puis la carte Bloc dès que la 3D est montrée ; l'aide de navigation 3D en infobulle « ? » |
+| IHM-2 | Tous les messages au même endroit, en bas à gauche, une ligne chacun, et rien quand rien ne se passe : téléchargement du relief (barre, pause), proposition de téléchargement, recherche des départements du cadre, construction du bloc, préparation des calques, enregistrement de l'image, téléchargement du Plan IGN de base, tuiles attendues par la carte (lues, téléchargées ou mises en style). L'issue de la dernière tâche, réussite ou erreur, s'efface après 10 s, ou tout de suite d'un clic sur « x » |
 | ZON-1 | Recherche de lieu avec autocomplétion (service Géoplateforme) ; la carte se centre sur le lieu choisi, au niveau de zoom 15 (\~5 km de large) |
 | ZON-2 | Cadre rectangulaire tracé et modifié uniquement sur la carte, côté ≤ 10 km, dimensions affichées |
 | TEL-1 | Une fois le cadre tracé, proposition de télécharger le relief RGE ALTI 5 m des seuls départements nécessaires au cadre, taille annoncée ; un seul bouton « Télécharger », sans case à cocher ni bouton « Plus tard » ; la proposition s'affiche immédiatement, la taille suit dès qu'elle est connue |
 | TEL-2 | Cadre à cheval sur plusieurs départements : on propose le plus petit ensemble d'archives qui couvre le cadre. Une archive contient toutes les dalles de 5 km qui touchent son département ; un département voisin n'est proposé que si une dalle du cadre ne touche aucun département déjà retenu ou installé (ex. Clécy : le Calvados suffit) |
 | TEL-3 | Progression, pause et reprise du téléchargement ; décompression et conversion automatiques |
-| STO-1 | Menu Options : relief de chaque département téléchargé, Plan IGN gardé pour la France (niveaux 0 à 10) et cache des tuiles, avec leur taille et leur suppression ; taille du cache réglable. Reporté : dossier de stockage au choix |
+| STO-1 | Menu Options : relief de chaque département téléchargé, Plan IGN de base (CAR-2) et cache des tuiles, avec leur taille et leur suppression ; taille du cache réglable. Reporté : dossier de stockage au choix |
 | GEN-1 | Bloc 3D à 5 m, pleine résolution, construit depuis les données locales |
 | GEN-2 | Socle fermé (faces latérales et dessous) |
 | GEN-3 | Bâtiments en 3D, toujours affichés : chaque bâtiment du Plan IGN est extrudé à sa hauteur réelle (non exagérée), posé sur le relief, en gris clair uni. L'eau en coupe sur les faces latérales a été essayée puis écartée : rendu peu convaincant, et pas de profondeur des lacs disponible |
 | NAV-1 | Projection axonométrique (orthographique) unique, celle des blocs diagrammes dessinés : sans point de fuite, une seule échelle sur tout le bloc ; orientation libre, la vue isométrique en est un cas particulier |
 | NAV-2 | Orientation libre à la souris : rotation, inclinaison, zoom, déplacement. Molette : zoom ; Maj + molette : déplacement gauche-droite ; Ctrl + molette : déplacement haut-bas. Même convention sur la carte et en 3D |
 | NAV-3 | Widget d'axes de navigation façon Blender / Godot : un clic sur un axe aligne la vue |
-| REG-1 | Curseur vertical unique à droite de la vue 3D, à deux poignées : étirement du relief (exagération x1 à x2, défaut proposé x1,5) et profondeur du socle (jusqu'à 1 000 m) |
+| REG-1 | Carte Bloc : étirement du relief (exagération x1 à x2, défaut x1,5) et profondeur du socle (10 à 1 000 m, curseur logarithmique, défaut 6 % de la largeur du bloc) |
 | REG-2 | Azimut et hauteur du soleil |
 | REG-3 | Ombres portées du relief |
 | EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 (défaut), 3 840, 5 760 ou 7 680 px sur le plus grand côté, dans la limite du GPU |
 | EXP-2 | Crédits des sources incrustés sur l'image (ex. « Source : IGN – Licence Ouverte ») |
 | EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages), cadré sur le bloc entier quels que soient le zoom et le déplacement à l'écran |
-| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo par défaut, de 100 Mo à 5 Go dans les options), les moins récemment vues effacées en premier. Les tuiles drapées sur un bloc y restent aussi : pas de téléchargement des calques à part |
-| CAR-2 | Les niveaux 0 à 10 du Plan IGN vectoriel sur la France métropolitaine (\~95 Mo, dont 89 Mo pour le niveau 10) sont téléchargés une fois, en tâche de fond : vues d'ensemble immédiates et disponibles hors connexion |
-| CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide ; fond de carte blanc. Plan IGN dessiné en tuiles de 512 px, comme le prévoit son style : détails et toponymes apparaissent un niveau de zoom plus tard, pour une carte moins chargée |
+| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : le Plan IGN de base (CAR-2) est gardé en permanence ; les autres tuiles partagent un cache plafonné (500 Mo par défaut, de 100 Mo à 5 Go dans les options), les moins récemment vues effacées en premier. Les tuiles drapées sur un bloc y restent aussi : pas de téléchargement des calques à part |
+| CAR-2 | Plan IGN de base : les niveaux 0 à 10 du Plan IGN vectoriel sur la France métropolitaine (\~95 Mo, dont 89 Mo pour le niveau 10), et les niveaux 0 à 4 sur le monde entier, téléchargés une fois, en tâche de fond : vues d'ensemble immédiates, jusqu'à l'échelle des continents, et disponibles hors connexion |
+| CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide ; fond de carte blanc. Plan IGN dessiné en tuiles de 512 px, comme le prévoit son style : détails et toponymes apparaissent un niveau de zoom plus tard, pour une carte moins chargée. Quand la carte bouge, les requêtes pas encore commencées sont abandonnées, celles en cours vont à leur terme |
 
 ## Système de calques
 
-Les calques se gèrent uniquement dans la vue Carte ; la vue 3D les applique tels quels sur le terrain du bloc. La pile se compose de la photo aérienne, toujours en dessous, et du Plan IGN vectoriel découpé en catégories, de haut en bas : toponymes, limites, routes et voies ferrées, bâti, eau, relief, végétation. Au premier lancement, toutes les catégories sont visibles et la photo aérienne masquée. En vue d'ensemble (niveaux de zoom inférieurs à 11), la carte montre le Plan IGN complet, quels que soient les calques choisis.
+Les calques se gèrent dans la carte Calques, présente dans toutes les vues ; la vue 3D les applique tels quels sur le terrain du bloc. La pile se compose de la photo aérienne, toujours en dessous, et du Plan IGN vectoriel découpé en catégories, de haut en bas : toponymes, limites, routes et voies ferrées, bâti, eau, relief, végétation. Au premier lancement, toutes les catégories sont visibles et la photo aérienne masquée. En vue d'ensemble (niveaux de zoom inférieurs à 11), la carte montre le Plan IGN complet, quels que soient les calques choisis.
 
 | ID | Exigence |
 | --- | --- |
-| CAL-1 | Pile de calques : visibilité et opacité de chaque calque, sans délai. Ordre fixe : celui du Plan IGN, la photo aérienne toujours en dessous |
+| CAL-1 | Pile de calques : visibilité et opacité de chaque calque, sans délai. Ordre fixe : celui du Plan IGN, la photo aérienne toujours en dessous. Les catégories du Plan IGN forment un groupe, replié par défaut, dont la visibilité et l'opacité s'appliquent à toutes ; chacune garde les siennes |
 | CAL-2 | Plan IGN vectoriel drapé, dessiné avec le style officiel de l'IGN et découpé en catégories selon les données des tuiles. Pas d'ombrage : l'éclairage de la 3D fait les ombres, un ombrage précalculé les doublerait (le Plan IGN en images, ombré, est écarté pour cette raison). Le fond blanc du Plan IGN n'est dessiné que si la photo aérienne est masquée |
 | CAL-3 | Photo aérienne drapée, seul calque image ; elle garde ses ombres naturelles. Reportés : styles réglables des catégories (couleur, épaisseur, remplissage), teintes d'altitude, mode de fusion (produit) |
 | CAL-4 | Import de fichiers : GeoTIFF, PNG / JPEG géoréférencé, GeoJSON, GPX, KML, GeoPackage, Shapefile |
@@ -102,7 +104,7 @@ Toutes les données par défaut viennent de l'IGN, sous Licence Ouverte 2.0 : r�
 | --- | --- | --- | --- | --- |
 | [RGE ALTI 5 m](https://geoservices.ign.fr/rgealti) | Relief du bloc | 5 m | Archives 7z par département (fichiers ASC, Lambert-93 / IGN69), service de téléchargement Géoplateforme | Mise à jour arrêtée en 2024 ; vide (nodata) sur les zones interdites (ZICAD) |
 | BD ORTHO | Couche photo aérienne | 20 cm à 50 cm (à confirmer) | WMTS, tuiles téléchargées pour l'emprise du cadre | Tuiles à reprojeter sur le maillage |
-| [Plan IGN vectoriel](https://data.geopf.fr/tms/1.0.0/PLAN.IGN) | Fond de la vue Carte, calques par catégorie, bâtiments 3D (hauteur et altitude au sol des bâtiments) | Multi-échelle | Tuiles vectorielles PLAN.IGN (TMS, niveaux 0 à 18) et style officiel « standard » de l'IGN, embarqué dans l'application | Sans ombrage ; niveaux 0 à 10 gardés sur le disque, cache plafonné au-delà (CAR-1) ; style converti à la volée pour walkers |
+| [Plan IGN vectoriel](https://data.geopf.fr/tms/1.0.0/PLAN.IGN) | Fond de la vue Carte, calques par catégorie, bâtiments 3D (hauteur et altitude au sol des bâtiments) | Multi-échelle | Tuiles vectorielles PLAN.IGN (TMS, niveaux 0 à 18) et style officiel « standard » de l'IGN, embarqué dans l'application | Sans ombrage ; Plan IGN de base gardé sur le disque (CAR-2), cache plafonné au-delà (CAR-1) ; style converti à la volée pour walkers |
 | [Géocodage Géoplateforme](https://www.data.gouv.fr/dataservices/api-geoplateforme-geocodage/discussions) | Recherche de lieu | — | REST `data.geopf.fr/geocodage` | Remplace l'API Adresse historique |
 
 Sources : [Référentiel à grande échelle (RGE) sur data.gouv.fr](https://www.data.gouv.fr/datasets/58e5842688ee386c65805755) · [Documentation des géoservices IGN](https://geoservices.ign.fr/usages)

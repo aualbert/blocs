@@ -35,6 +35,8 @@ const START: (f64, f64) = (2.35, 46.6);
 /// starting speed as a share of the pointer's, and decay time (s).
 const GLIDE_SPEED: f32 = 1.0;
 const GLIDE_TAU: f32 = 0.12;
+/// How long a job's outcome stays shown, in seconds.
+const NOTE_SECS: f32 = 10.0;
 /// Export sizes offered: the image's longer side, in pixels.
 const EXPORT_WIDTHS: [u32; 5] = [1280, 1920, 3840, 5760, 7680];
 
@@ -90,6 +92,27 @@ struct MapLayer {
     tiles: MapTiles,
 }
 
+/// Toggle and opacity of a family of layers.
+#[derive(Clone, Copy)]
+struct Family {
+    visible: bool,
+    opacity: f32,
+}
+
+impl MapLayer {
+    /// Its opacity if shown; a Plan IGN category also needs its family `plan` shown.
+    fn shown(&self, plan: Family) -> Option<f32> {
+        let family = match self.category {
+            Some(_) => plan,
+            None => Family {
+                visible: true,
+                opacity: 1.0,
+            },
+        };
+        (family.visible && self.visible).then_some(family.opacity * self.opacity)
+    }
+}
+
 /// The Plan IGN's opaque background on the block, under the stack when the photo is hidden.
 const BACKGROUND: &str = "fond";
 /// Pseudo-layer of the 3D buildings, always on, made from the Plan IGN tiles.
@@ -124,13 +147,20 @@ struct Blocs {
     ctx: egui::Context,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    status: String,
+    /// How the last job ended, and when: shown for `NOTE_SECS`.
+    status: Option<(String, Instant)>,
 
     /// The layer stack, top first: Plan IGN categories, then the photo.
     layers: Vec<MapLayer>,
+    /// The Plan IGN categories together.
+    vector: Family,
     /// The Plan IGN's opaque background, drawn when the photo is not.
     background: walkers::StyledSources,
     plan: Store,
+    /// Its tiles, for the overview's download progress.
+    plan_tiles: PlanIgnTiles,
+    /// Tiles the map waits for, as last drawn.
+    map_loading: usize,
     map_memory: MapMemory,
     /// Map speed after a drag pan, in points per second.
     glide: egui::Vec2,
@@ -155,10 +185,11 @@ struct Blocs {
     draped: HashSet<&'static str>,
     draping: HashSet<&'static str>,
     view: View,
+    /// The map's share of the width, side by side.
+    split: f32,
     export_width: u32,
-    /// An export is being saved; then how the last one ended.
+    /// An export is being saved.
     exporting: bool,
-    export_note: String,
     /// `None` while measuring.
     storage: Option<Storage>,
     /// Cache limit set in the options, in MB.
@@ -213,10 +244,16 @@ impl Blocs {
             ctx: cc.egui_ctx.clone(),
             tx,
             rx,
-            status: String::new(),
+            status: None,
             layers,
+            vector: Family {
+                visible: true,
+                opacity: 1.0,
+            },
             background,
             plan,
+            plan_tiles,
+            map_loading: 0,
             map_memory,
             glide: egui::Vec2::ZERO,
             frame: None,
@@ -243,12 +280,17 @@ impl Blocs {
             draped: HashSet::new(),
             draping: HashSet::new(),
             view: View::Map,
+            split: 0.5,
             export_width: EXPORT_WIDTHS[1],
             exporting: false,
-            export_note: String::new(),
             storage: None,
             cache_mb: (tiles::cache_limit() / 1_000_000) as u32,
         }
+    }
+
+    /// Shows `text` in the activity stack for `NOTE_SECS`.
+    fn note(&mut self, text: String) {
+        self.status = Some((text, Instant::now()));
     }
 
     /// Runs `work` on a thread; its messages wake the UI.
@@ -265,7 +307,7 @@ impl Blocs {
     fn poll(&mut self, frame: &eframe::Frame) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Status(text) => self.status = text,
+                Msg::Status(text) => self.note(text),
                 Msg::Storage(storage) => {
                     // A relief was deleted: look the frame's départements up again.
                     let deps: Vec<_> = storage.reliefs.iter().map(|r| r.1.clone()).collect();
@@ -277,7 +319,7 @@ impl Blocs {
                 }
                 Msg::Exported(note) => {
                     self.exporting = false;
-                    self.export_note = note;
+                    self.note(note);
                 }
                 Msg::Places(query, places) => {
                     if query == self.search.trim() {
@@ -311,7 +353,7 @@ impl Blocs {
                     };
                 }
                 Msg::Installed(dep) => {
-                    self.status = format!("Relief installé : {}.", ign::department_name(&dep));
+                    self.note(format!("Relief installé : {}.", ign::department_name(&dep)));
                     self.download.queue.retain(|d| *d != dep);
                     self.download.running = false;
                     self.installed = relief::installed();
@@ -326,7 +368,7 @@ impl Blocs {
                     self.download.running = false;
                     if !self.download.pause.load(Ordering::Relaxed) {
                         self.download.pause.store(true, Ordering::Relaxed);
-                        self.status = format!("Téléchargement interrompu : {error}");
+                        self.note(format!("Téléchargement interrompu : {error}"));
                     }
                 }
                 Msg::Draped(built, id, result) => {
@@ -347,7 +389,7 @@ impl Blocs {
                         Err(e) => {
                             // Not retried for this block: moving the frame or reopening asks again.
                             self.draped.insert(id);
-                            self.status = format!("Calque indisponible sur le bloc : {e}");
+                            self.note(format!("Calque indisponible sur le bloc : {e}"));
                         }
                     }
                 }
@@ -365,8 +407,8 @@ impl Blocs {
                 Msg::Built(built, result) => {
                     self.building = false;
                     match result {
-                        Ok((map, text)) => {
-                            let start = Instant::now();
+                        // The description is for the headless command only.
+                        Ok((map, _)) => {
                             let rs = frame.wgpu_render_state().expect("rendu wgpu");
                             if let Some(old) = &mut self.view3d {
                                 old.release(rs);
@@ -377,13 +419,10 @@ impl Blocs {
                             // The new block starts without layer images.
                             self.draped.clear();
                             self.draping.clear();
-                            self.status = format!(
-                                "{text} · envoyé au GPU en {:.2} s",
-                                start.elapsed().as_secs_f64()
-                            );
                             self.built = Some(built);
+                            self.view = View::Split;
                         }
-                        Err(e) => self.status = format!("Échec : {e}"),
+                        Err(e) => self.note(format!("Échec : {e}")),
                     }
                 }
             }
@@ -479,32 +518,19 @@ impl Blocs {
         });
     }
 
-    /// Why the 3D view can't open yet, if it can't.
-    fn missing_3d(&self) -> Option<String> {
-        if self.frame.is_none() {
-            return Some("Tracez d'abord un cadre sur la carte.".into());
-        }
-        // The block waits for the frame's départements, so as not to build it without them.
-        let Some(codes) = &self.in_frame.codes else {
-            return Some("Recherche des départements du cadre…".into());
-        };
-        let missing: Vec<_> = codes
-            .iter()
-            .filter(|c| !self.installed.contains(c))
-            .map(|c| ign::department_name(c))
-            .collect();
-        (!missing.is_empty())
-            .then(|| format!("Téléchargez d'abord le relief : {}.", missing.join(", ")))
+    /// The frame is drawn, and all its départements are known and installed.
+    fn relief_ready(&self) -> bool {
+        let codes = self.in_frame.codes.as_ref();
+        self.frame.is_some() && codes.is_some_and(|c| c.iter().all(|c| self.installed.contains(c)))
     }
 
-    /// Builds the frame's block, once drawn and its relief installed, while a view shows it.
+    /// Builds the frame's block as soon as it is drawn and its relief installed.
     fn build_if_ready(&mut self) {
         let Some(frame) = self.frame else { return };
-        let ready = self.edit.is_none() && self.missing_3d().is_none();
-        if self.view != View::Map && ready && !self.building && self.tried != Some(frame) {
+        let ready = self.edit.is_none() && self.relief_ready();
+        if ready && !self.building && self.tried != Some(frame) {
             self.tried = Some(frame);
             self.building = true;
-            self.status = "Construction du bloc…".into();
             self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
         }
     }
@@ -517,7 +543,7 @@ impl Blocs {
         };
         let background = (!self.photo_visible()).then_some((BACKGROUND, None));
         // Bottom first, so the block fills in from its background up to the labels.
-        let visible = self.layers.iter().rev().filter(|l| l.visible);
+        let visible = (self.layers.iter().rev()).filter(|l| l.shown(self.vector).is_some());
         let wanted: Vec<_> = (background.into_iter())
             .chain([(BUILDINGS, None)])
             .chain(visible.map(|l| (l.id, l.category)))
@@ -576,11 +602,8 @@ impl Blocs {
     /// The visible layers, bottom first, with their opacity.
     fn stack(&self) -> Vec<(&'static str, f32)> {
         let background = (!self.photo_visible()).then_some((BACKGROUND, 1.0));
-        let visible = self.layers.iter().rev().filter(|l| l.visible);
-        background
-            .into_iter()
-            .chain(visible.map(|l| (l.id, l.opacity)))
-            .collect()
+        let shown = (self.layers.iter().rev()).filter_map(|l| Some((l.id, l.shown(self.vector)?)));
+        background.into_iter().chain(shown).collect()
     }
 
     fn export(&mut self, frame: &eframe::Frame) {
@@ -620,22 +643,10 @@ impl Blocs {
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.view, View::Map, "Carte");
-            // Without a block, these show an empty view; the tip says what is missing.
-            let missing = self.missing_3d();
-            for (view, text) in [(View::Block, "3D"), (View::Split, "Côte à côte")] {
-                let button = ui.selectable_value(&mut self.view, view, text);
-                if let Some(missing) = &missing {
-                    button.on_hover_text(missing);
-                }
-            }
-            self.options(ui);
-            ui.separator();
-
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("Rechercher un lieu…")
-                    .desired_width(260.0),
+                    .desired_width(220.0),
             );
             if search.changed() {
                 self.search_typed = Some(Instant::now());
@@ -645,19 +656,30 @@ impl Blocs {
                 self.go_to(0);
             }
             self.search_results(ui, &search);
-
-            if self.view != View::Block {
-                ui.separator();
+            // Greyed out without the map, so that the bar keeps its layout.
+            ui.add_enabled_ui(self.view != View::Block, |ui| {
                 ui.toggle_value(&mut self.drawing, "Tracer le cadre")
                     .on_hover_text(
                         "Glissez sur la carte pour tracer le cadre (10 km au plus par côté).",
                     );
-                if let Some(frame) = self.frame {
-                    ui.label(format!("Cadre {}", frame.label()));
-                }
+            });
+            self.options(ui);
+        });
+    }
+
+    /// One view left by the separator: switch it, or show both again.
+    fn view_bar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let (other, text) = match self.view {
+                View::Map => (View::Block, "Vue 3D"),
+                _ => (View::Map, "Carte"),
+            };
+            if ui.button(text).clicked() {
+                self.view = other;
             }
-            ui.separator();
-            ui.label(&self.status);
+            if ui.button("Vue double").clicked() {
+                self.view = View::Split;
+            }
         });
     }
 
@@ -720,69 +742,116 @@ impl Blocs {
         self.places.clear();
     }
 
-    /// The relief download in progress, with its pause button; `bar`: as a progress bar.
-    fn download_progress(&mut self, ui: &mut egui::Ui, bar: bool) {
-        ui.horizontal(|ui| {
-            let paused = !self.download.running;
-            // No pause while converting; a failed conversion can still be resumed.
-            let pausable = paused || !self.download.converting;
-            if pausable
-                && ui
-                    .button(if paused { "Reprendre" } else { "Pause" })
-                    .clicked()
-            {
-                if paused {
-                    self.next_download();
-                } else {
-                    self.download.pause.store(true, Ordering::Relaxed);
-                }
-            }
-            let mut text = self.download.text.clone();
-            if self.download.queue.len() > 1 {
-                text += &format!(" · {} en attente", self.download.queue.len() - 1);
-            }
+    /// The relief download in progress, with its pause button.
+    fn download_progress(&mut self, ui: &mut egui::Ui) {
+        let paused = !self.download.running;
+        // No pause while converting; a failed conversion can still be resumed.
+        let pausable = paused || !self.download.converting;
+        if pausable
+            && ui
+                .button(if paused { "Reprendre" } else { "Pause" })
+                .clicked()
+        {
             if paused {
-                text += " · en pause";
-            }
-            if bar {
-                ui.add(egui::ProgressBar::new(self.download.fraction).text(text));
+                self.next_download();
             } else {
-                ui.label(text);
+                self.download.pause.store(true, Ordering::Relaxed);
             }
-        });
+        }
+        let mut text = self.download.text.clone();
+        if self.download.queue.len() > 1 {
+            text += &format!(" · {} en attente", self.download.queue.len() - 1);
+        }
+        if paused {
+            text += " · en pause";
+        }
+        ui.add(
+            egui::ProgressBar::new(self.download.fraction)
+                .text(text)
+                .desired_width(360.0),
+        );
     }
 
-    /// Offer to download the relief, or show the download in progress.
-    fn download_bar(&mut self, ui: &mut egui::Ui) {
-        let proposal = self.proposal();
-        let offer = !proposal.is_empty();
-        if !offer && self.download.queue.is_empty() {
-            return;
+    /// Everything under way, then how the last job ended: one line each, stacked.
+    fn activity(&mut self, ui: &mut egui::Ui) {
+        let busy = |ui: &mut egui::Ui, text: &str| {
+            line(ui, |ui| {
+                ui.spinner();
+                ui.label(text);
+            })
+        };
+        if !self.download.queue.is_empty() {
+            line(ui, |ui| self.download_progress(ui));
         }
-        egui::Panel::bottom("téléchargement").show(ui, |ui| {
-            if !self.download.queue.is_empty() {
-                self.download_progress(ui, true);
+        let proposal = self.proposal();
+        if !proposal.is_empty() {
+            line(ui, |ui| {
+                let names: Vec<_> = proposal.iter().map(|d| ign::department_name(d)).collect();
+                ui.label(format!("Relief à télécharger : {}", names.join(", ")));
+                // The total shows once every size is known.
+                let sizes: Option<Vec<u64>> = proposal
+                    .iter()
+                    .map(|d| self.sizes.get(d).copied())
+                    .collect();
+                let label = match sizes {
+                    Some(s) => format!("Télécharger ({})", megabytes(s.iter().sum())),
+                    None => "Télécharger".into(),
+                };
+                if ui.button(label).clicked() {
+                    self.download.queue.extend(proposal);
+                    self.next_download();
+                }
+            });
+        }
+        if self.in_frame.frame.is_some() && self.in_frame.codes.is_none() {
+            busy(ui, "Recherche des départements du cadre…");
+        }
+        if self.building {
+            busy(ui, "Construction du bloc…");
+        }
+        if !self.draping.is_empty() {
+            let names: Vec<_> = (self.layers.iter())
+                .map(|l| (l.id, l.name))
+                .chain([(BACKGROUND, "Fond du Plan IGN"), (BUILDINGS, "Bâtiments")])
+                .filter(|(id, _)| self.draping.contains(id))
+                .map(|(_, name)| name)
+                .collect();
+            busy(ui, &format!("Préparation : {}", names.join(", ")));
+        }
+        if self.exporting {
+            busy(ui, "Enregistrement de l'image…");
+        }
+        if let Some((done, total)) = self.plan_tiles.seed_progress() {
+            line(ui, |ui| {
+                let text = format!("Plan IGN de base : {done} / {total} tuiles");
+                let bar = egui::ProgressBar::new(done as f32 / total as f32).text(text);
+                ui.add(bar.desired_width(360.0));
+            });
+            // Its tiles arrive without waking the UI.
+            ui.ctx().request_repaint_after_secs(1.0);
+        } else {
+            // Counted while drawing the map: none without it.
+            let n = self.map_loading;
+            if n > 0 && self.view != View::Block {
+                busy(ui, &format!("Chargement de la carte : {n} tuiles"));
             }
-            if offer {
-                ui.horizontal(|ui| {
-                    let names: Vec<_> = proposal.iter().map(|d| ign::department_name(d)).collect();
-                    ui.label(format!("Relief à télécharger : {}", names.join(", ")));
-                    // The total shows once every size is known.
-                    let sizes: Option<Vec<u64>> = proposal
-                        .iter()
-                        .map(|d| self.sizes.get(d).copied())
-                        .collect();
-                    let label = match sizes {
-                        Some(s) => format!("Télécharger ({})", megabytes(s.iter().sum())),
-                        None => "Télécharger".into(),
-                    };
-                    if ui.button(label).clicked() {
-                        self.download.queue.extend(proposal);
-                        self.next_download();
-                    }
+        }
+        if let Some((text, at)) = self.status.clone() {
+            // Fades out over its last second, or goes at once on "x".
+            let left = NOTE_SECS - at.elapsed().as_secs_f32();
+            let mut close = left <= 0.0;
+            ui.scope(|ui| {
+                ui.set_opacity(left.clamp(0.0, 1.0));
+                line(ui, |ui| {
+                    ui.label(text);
+                    close |= ui.small_button("x").clicked();
                 });
+            });
+            ui.ctx().request_repaint_after_secs((left - 1.0).max(0.0));
+            if close {
+                self.status = None;
             }
-        });
+        }
     }
 
     /// The options menu: downloaded data, its disk space, and what to delete.
@@ -816,11 +885,6 @@ impl Blocs {
     fn options_menu(&mut self, ui: &mut egui::Ui) {
         // A fixed width, which the département list fills, its scroll bar on the edge.
         ui.set_width(360.0);
-        if !self.download.queue.is_empty() {
-            ui.strong("Relief en téléchargement");
-            self.download_progress(ui, false);
-            ui.separator();
-        }
         let Some(storage) = &self.storage else {
             ui.spinner();
             return;
@@ -857,7 +921,7 @@ impl Blocs {
             });
         ui.separator();
 
-        ui.strong("Plan IGN de la France");
+        ui.strong("Plan IGN de base");
         ui.horizontal(|ui| {
             if confirmed(ui, "plan", true) {
                 job = Some(Box::new(|| tiles::delete(true)));
@@ -892,74 +956,82 @@ impl Blocs {
     /// The layers, top first, each shown or hidden, with its opacity. Their order is
     /// IGN's cartographic one, the photo always at the bottom.
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Calques");
+        ui.strong("Calques");
         if self.map_memory.zoom() < layers::STACK_ZOOM as f64 {
-            ui.label("Vue d'ensemble : Plan IGN complet.\nZoomez pour choisir les calques.");
+            ui.weak("Zoomez pour afficher les calques.");
         }
-        for layer in &mut self.layers {
-            ui.checkbox(&mut layer.visible, layer.name);
-            ui.add_enabled(
-                layer.visible,
-                egui::Slider::new(&mut layer.opacity, 0.0..=1.0)
-                    .show_value(false)
-                    .text("opacité"),
-            );
-            ui.separator();
+        // A fixed width, so the sliders line up on the right edge.
+        ui.set_width(240.0);
+        ui.spacing_mut().slider_width = 90.0;
+        // The photo comes last.
+        let last = self.layers.len() - 1;
+        let (plan, photo) = self.layers.split_at_mut(last);
+        // The Plan IGN row unfolds to its categories.
+        let id = ui.make_persistent_id("plan ign");
+        egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+            .show_header(ui, |ui| {
+                layer_row(
+                    ui,
+                    &mut self.vector.visible,
+                    &mut self.vector.opacity,
+                    "Plan IGN",
+                )
+            })
+            .body(|ui| {
+                ui.add_enabled_ui(self.vector.visible, |ui| {
+                    for layer in plan {
+                        layer_row(ui, &mut layer.visible, &mut layer.opacity, layer.name);
+                    }
+                });
+            });
+        for layer in photo {
+            layer_row(ui, &mut layer.visible, &mut layer.opacity, layer.name);
         }
     }
 
     fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        if !self.draping.is_empty() {
-            let names: Vec<_> = (self.layers.iter())
-                .map(|l| (l.id, l.name))
-                .chain([(BACKGROUND, "Fond du Plan IGN"), (BUILDINGS, "Bâtiments")])
-                .filter(|(id, _)| self.draping.contains(id))
-                .map(|(_, name)| name)
-                .collect();
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(format!("Préparation : {}", names.join(", ")));
+        egui::CollapsingHeader::new("Bloc")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.spacing_mut().slider_width = 110.0;
+                // Without a block, the same controls, greyed out on placeholder values.
+                let block = self.view3d.is_some();
+                let mut none = (1.5, 300.0);
+                let (exaggeration, base_depth) = match &mut self.view3d {
+                    Some(view) => (&mut view.exaggeration, &mut view.base_depth),
+                    None => (&mut none.0, &mut none.1),
+                };
+                ui.add_enabled_ui(block, |ui| {
+                    egui::Grid::new("bloc").show(ui, |ui| {
+                        ui.label("Relief");
+                        ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
+                        ui.end_row();
+                        ui.label("Socle");
+                        ui.add(egui::Slider::new(base_depth, view3d::BASE_DEPTHS)
+                                .logarithmic(true)
+                                .suffix(" m"));
+                        ui.end_row();
+                    });
+                });
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt("largeur")
+                        .selected_text(format!("{} px", self.export_width))
+                        .show_ui(ui, |ui| {
+                            for w in EXPORT_WIDTHS {
+                                ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
+                            }
+                        });
+                    let export = ui
+                        .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
+                        .on_hover_text("Image PNG, fond transparent");
+                    if export.clicked() {
+                        self.export(frame);
+                    }
+                    ui.weak("?").on_hover_text(
+                        "Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil",
+                    );
+                });
             });
-            ui.separator();
-        }
-        // Without a block, the same controls, greyed out on placeholder values.
-        let block = self.view3d.is_some();
-        let mut none = (1.5, 300.0);
-        let (exaggeration, base_depth) = match &mut self.view3d {
-            Some(view) => (&mut view.exaggeration, &mut view.base_depth),
-            None => (&mut none.0, &mut none.1),
-        };
-        ui.add_enabled_ui(block, |ui| {
-            ui.label("Étirement du relief");
-            ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
-            ui.label("Profondeur du socle");
-            ui.add(egui::Slider::new(base_depth, 50.0..=1000.0).suffix(" m"));
-        });
-        ui.separator();
-        ui.label("Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil");
-        ui.separator();
-        ui.label("Image PNG (fond transparent)");
-        egui::ComboBox::from_id_salt("largeur")
-            .selected_text(format!("{} px", self.export_width))
-            .show_ui(ui, |ui| {
-                for w in EXPORT_WIDTHS {
-                    ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
-                }
-            });
-        if ui
-            .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
-            .clicked()
-        {
-            self.export(frame);
-        }
-        if self.exporting {
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label("Enregistrement de l'image…");
-            });
-        } else {
-            ui.label(&self.export_note);
-        }
     }
 }
 
@@ -968,34 +1040,89 @@ impl eframe::App for Blocs {
         self.poll(frame);
         self.refresh_lookup();
         self.drape_visible(frame.wgpu_render_state());
-
-        egui::Panel::top("barre").show(ui, |ui| self.top_bar(ui));
         self.build_if_ready();
-        if self.view != View::Map {
-            egui::Panel::right("réglages").show(ui, |ui| self.settings_3d(ui, frame));
-        }
-        if self.view != View::Block {
-            egui::Panel::left("calques").show(ui, |ui| self.layers_panel(ui));
-        }
-        self.download_bar(ui);
+
+        // The views fill the window; the controls float over them on cards.
+        let all = ui.available_rect_before_wrap();
         match self.view {
             View::Map => self.map_view(ui),
             View::Block => self.block_view(ui, frame),
-            View::Split => {
-                // The map on the left, its edge dragged to share the width with the block.
-                let width = ui.available_width();
-                egui::Panel::left("carte")
-                    .frame(egui::Frame::NONE)
-                    .default_size(width / 2.0)
-                    .size_range(200.0..=(width - 200.0).max(200.0))
-                    .show(ui, |ui| self.map_view(ui));
-                self.block_view(ui, frame);
-            }
+            View::Split => self.split_view(ui, frame, all),
         }
+        // Down the left edge: toolbar, layers, then the block's settings.
+        let ctx = ui.ctx().clone();
+        let below = |r: egui::Response| egui::pos2(all.left(), r.rect.bottom());
+        let bar = card(&ctx, "barre", all.left_top(), |ui| self.top_bar(ui));
+        if self.view3d.is_some() && self.view != View::Split {
+            let corner = egui::pos2(bar.response.rect.right(), all.top());
+            card(&ctx, "vues", corner, |ui| self.view_bar(ui));
+        }
+        let layers = card(&ctx, "calques", below(bar.response), |ui| {
+            self.layers_panel(ui)
+        });
+        if self.view != View::Map {
+            card(&ctx, "réglages", below(layers.response), |ui| {
+                self.settings_3d(ui, frame)
+            });
+        }
+        egui::Area::new(egui::Id::unique("activité"))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .fixed_pos(all.left_bottom() + egui::vec2(MARGIN, -MARGIN))
+            .show(&ctx, |ui| self.activity(ui));
     }
 }
 
 impl Blocs {
+    /// The map on the left, the block on the right, their separator dragged. Let go
+    /// against an edge, it leaves the other view alone.
+    fn split_view(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, all: egui::Rect) {
+        let x = all.left() + self.split * all.width();
+        let (left, right) = all.split_left_right_at_x(x);
+        for (rect, map) in [(left, true), (right, false)] {
+            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                ui.set_clip_rect(rect);
+                if map {
+                    self.map_view(ui)
+                } else {
+                    self.block_view(ui, frame)
+                }
+            });
+        }
+        // Added last, the handle gets the pointer over both views.
+        let handle = egui::Rect::from_x_y_ranges(x - 4.0..=x + 4.0, all.y_range());
+        let drag = ui.interact(
+            handle,
+            ui.scope_id().with("séparateur"),
+            egui::Sense::drag(),
+        );
+        let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+        ui.painter()
+            .vline(x, all.y_range(), egui::Stroke::new(2.0, stroke.color));
+        if drag.hovered() || drag.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if let Some(p) = drag.interact_pointer_pos() {
+            // Near an edge, it snaps to it.
+            let edge = EDGE / all.width();
+            self.split = match (p.x - all.left()) / all.width() {
+                s if s < edge => 0.0,
+                s if s > 1.0 - edge => 1.0,
+                s => s,
+            };
+        }
+        if drag.drag_stopped() {
+            if self.split == 0.0 {
+                self.view = View::Block;
+            } else if self.split == 1.0 {
+                self.view = View::Map;
+            }
+            // Back to halves for the next time both show.
+            if self.view != View::Split {
+                self.split = 0.5;
+            }
+        }
+    }
+
     /// The block, or nothing until there is one.
     fn block_view(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let stack = self.stack();
@@ -1021,7 +1148,7 @@ impl Blocs {
             .rect_filled(ui.available_rect_before_wrap(), 0.0, egui::Color32::WHITE);
         let pan = !self.drawing && self.edit.is_none();
         let overview = self.map_memory.zoom() < layers::STACK_ZOOM as f64;
-        let photo = self.photo_visible();
+        let (photo, vector) = (self.photo_visible(), self.vector);
         let mut map = Map::new(None, &mut self.map_memory, lon_lat(START.0, START.1))
             // walkers defaults to Ctrl + wheel zoom and plain-wheel panning.
             .zoom_with_ctrl(false)
@@ -1037,21 +1164,33 @@ impl Blocs {
             });
         // Zoomed out, the whole Plan IGN kept on disk; zoomed in, the chosen layers, bottom
         // first. The Plan IGN's white background would hide the photo, so it goes without.
+        // Tiles the drawn layers wait for: queued, read, downloaded or styled. walkers counts
+        // the shared Plan IGN fetches in each category's, so they are counted once apart.
+        let fetch = walkers::TiledSource::stats(&self.plan_tiles).in_progress;
+        let mut loading = 0;
         if overview || !photo {
+            loading += self.background.stats().in_progress.saturating_sub(fetch);
             map = map.with_layer(&mut self.background, 1.0);
         }
         for layer in self.layers.iter_mut().rev() {
             let opacity = match overview {
-                true if layer.id != "photo" => 1.0,
-                false if layer.visible => layer.opacity,
-                _ => continue,
+                true => (layer.id != "photo").then_some(1.0),
+                false => layer.shown(vector),
             };
+            let Some(opacity) = opacity else { continue };
             map = match &mut layer.tiles {
-                MapTiles::Images(tiles) => map.with_layer(tiles, opacity),
-                MapTiles::Styled(styled) => map.with_layer(styled, opacity),
+                MapTiles::Images(tiles) => {
+                    loading += walkers::Tiles::stats(tiles).in_progress;
+                    map.with_layer(tiles, opacity)
+                }
+                MapTiles::Styled(styled) => {
+                    loading += styled.stats().in_progress.saturating_sub(fetch);
+                    map.with_layer(styled, opacity)
+                }
             };
         }
         let response = ui.add(map);
+        self.map_loading = loading + fetch;
 
         // Replace walkers' glide on release, which carries the map too far, with ours.
         let (velocity, dt) = ui.input(|i| (i.pointer.velocity(), i.stable_dt));
@@ -1071,6 +1210,40 @@ impl Blocs {
             ui.ctx().request_repaint();
         }
     }
+}
+
+/// The separator snaps to an edge this close, in points; let go there, it leaves one view.
+const EDGE: f32 = 100.0;
+
+/// Space between the cards and the window's edges.
+const MARGIN: f32 = 8.0;
+
+/// A card floating over the views, its top left corner a margin away from `corner`.
+fn card<R>(
+    ctx: &egui::Context,
+    id: &str,
+    corner: egui::Pos2,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    egui::Area::new(egui::Id::unique(id))
+        .fixed_pos(corner + egui::Vec2::splat(MARGIN))
+        .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, add).inner)
+}
+
+/// A layer's toggle, then its opacity slider at the row's right end.
+fn layer_row(ui: &mut egui::Ui, visible: &mut bool, opacity: &mut f32, name: &str) {
+    ui.horizontal(|ui| {
+        ui.checkbox(visible, name);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let slider = egui::Slider::new(opacity, 0.0..=1.0).show_value(false);
+            ui.add_enabled(*visible, slider).on_hover_text("Opacité");
+        });
+    });
+}
+
+/// One line of the activity stack, on its own small card.
+fn line(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::popup(ui.style()).show(ui, |ui| ui.horizontal(add));
 }
 
 /// A "Supprimer" button that asks "Confirmer" on the first click; leaving it disarms it.

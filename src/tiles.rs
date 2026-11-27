@@ -36,6 +36,8 @@ const RETRY: Duration = Duration::from_secs(30);
 /// Plan IGN levels kept on disk for all of metropolitan France, so overviews load at once
 /// and deeper levels always have a coarser tile to stand in while loading.
 const SEED_ZOOM: u8 = 10;
+/// Up to this level, the whole world is kept, so zooming out to continents shows no gaps.
+const WORLD_ZOOM: u8 = 4;
 const FRANCE: [f64; 4] = [-5.5, 41.2, 10.0, 51.2]; // lon/lat bounds, Corsica included
 /// Disk space for all tiles but the seeded ones, unless changed in the options.
 const CACHE_LIMIT: u64 = 500_000_000;
@@ -175,6 +177,8 @@ struct Fetcher {
     store: Store,
     tiles: HashMap<TileId, State>,
     queue: Queue,
+    /// Overview tiles missing at start-up.
+    seed_total: usize,
     done: Receiver<(TileId, Option<Fetched>)>,
     /// Sum and count of the visible tiles' centres this pass.
     seen: (f64, f64, u32),
@@ -189,11 +193,12 @@ impl Fetcher {
         let seed = match seed {
             true => (0..=SEED_ZOOM)
                 .rev()
-                .flat_map(france_tiles)
+                .flat_map(seed_tiles)
                 .filter(|id| !store.path(*id).exists())
                 .collect(),
             false => Vec::new(),
         };
+        let seed_total = seed.len();
         let queue: Queue = Arc::new((
             Mutex::new(Pending {
                 seed,
@@ -219,6 +224,7 @@ impl Fetcher {
             store,
             tiles: HashMap::new(),
             queue,
+            seed_total,
             done,
             seen: (0.0, 0.0, 0),
             pass: 0,
@@ -387,6 +393,15 @@ impl PlanIgnTiles {
         Self {
             fetcher: Rc::new(RefCell::new(Fetcher::new(ctx, store, true))),
         }
+    }
+}
+
+impl PlanIgnTiles {
+    /// Overview tiles fetched and to fetch, while some are left.
+    pub fn seed_progress(&self) -> Option<(usize, usize)> {
+        let f = self.fetcher.borrow();
+        let left = f.queue.0.lock().unwrap().seed.len();
+        (left > 0).then_some((f.seed_total - left, f.seed_total))
     }
 }
 
@@ -581,12 +596,14 @@ pub fn trim_cache() {
     }
 }
 
-/// Web Mercator tiles covering metropolitan France at `zoom`.
-fn france_tiles(zoom: u8) -> impl Iterator<Item = TileId> {
+/// Web Mercator tiles kept on disk at `zoom`: the whole world, then metropolitan France.
+fn seed_tiles(zoom: u8) -> impl Iterator<Item = TileId> {
     let n = (1u32 << zoom) as f64;
+    // The whole world: its bounds' ends fall on the last tile.
+    let world = [-180.0, -85.0, 179.9, 85.0];
+    let [lon0, lat0, lon1, lat1] = if zoom <= WORLD_ZOOM { world } else { FRANCE };
     let x = move |lon: f64| ((lon + 180.0) / 360.0 * n) as u32;
     let y = move |lat: f64| ((1.0 - lat.to_radians().tan().asinh() / PI) / 2.0 * n) as u32;
-    let [lon0, lat0, lon1, lat1] = FRANCE;
     (x(lon0)..=x(lon1))
         .flat_map(move |tx| (y(lat1)..=y(lat0)).map(move |ty| TileId { x: tx, y: ty, zoom }))
 }
@@ -594,6 +611,13 @@ fn france_tiles(zoom: u8) -> impl Iterator<Item = TileId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_world_is_seeded_up_to_its_zoom_then_france() {
+        let tiles = seed_tiles(WORLD_ZOOM).count();
+        assert_eq!(tiles, 1 << (2 * WORLD_ZOOM));
+        assert!(seed_tiles(WORLD_ZOOM + 1).count() < 20);
+    }
 
     #[test]
     fn fetches_from_the_centre_outwards() {

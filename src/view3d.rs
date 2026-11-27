@@ -24,6 +24,8 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Layer images stacked on the surface, mirrored in terrain.wgsl.
 pub const SLOTS: usize = 8;
+/// Depths offered for the base, in metres.
+pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 10.0..=1000.0;
 /// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
 const SAMPLES: u32 = 4;
 
@@ -169,7 +171,9 @@ impl View3d {
             zoom: extent.0.max(extent.1) * 0.55,
             target: Vec3::ZERO,
             exaggeration: 1.5,
-            base_depth: extent.0.max(extent.1) * 0.06,
+            // 6 % of the block's width, within the depths offered.
+            base_depth: (extent.0.max(extent.1) * 0.06)
+                .clamp(*BASE_DEPTHS.start(), *BASE_DEPTHS.end()),
             extent,
             points: (map.nx as u32, map.ny as u32),
             range: map.range(),
@@ -363,8 +367,9 @@ impl View3d {
 
         let to_widget = |d: Vec3| center + radius * egui::vec2(d.dot(right), -d.dot(up));
         let path = self.sun.path().into_iter().map(to_widget).collect();
-        let faint = egui::Color32::from_rgba_unmultiplied(250, 200, 40, 120);
-        painter.line(path, egui::Stroke::new(2.0, faint));
+        // Opaque: half transparent, the path looked thinner than the axes.
+        let gold = egui::Color32::from_rgb(250, 200, 40);
+        painter.line(path, egui::Stroke::new(2.0, gold));
         let sun = self.sun.dir();
         let sun_pos = to_widget(sun);
         let draw_sun = || {
