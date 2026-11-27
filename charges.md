@@ -32,7 +32,7 @@ La version 1 couvre la France métropolitaine (Corse comprise), sur ordinateur.
 - Relief RGE ALTI 5 m, téléchargé par département.
 - Blocs jusqu'à \~10 km de côté, en pleine résolution.
 - Deux vues, Carte et 3D, avec écran partagé.
-- Couches gérées sur la carte, appliquées sur le terrain 3D, téléchargeables pour l'emprise du cadre.
+- Couches gérées sur la carte, appliquées sur le terrain 3D, gardées en cache pour un usage hors connexion.
 - Export PNG à fond transparent.
 - Windows, Linux, macOS.
 
@@ -44,28 +44,27 @@ Le parcours nominal tient en huit étapes ; le téléchargement (étape 4) n'a l
 2. Il cherche un lieu ou zoome sur la carte.
 3. Il trace un cadre rectangulaire ; ses dimensions s'affichent en km et le cadre ne dépasse pas 10 km.
 4. Si le relief manque, l'app propose aussitôt de télécharger le ou les départements nécessaires au cadre, avec la taille totale ; il accepte d'un clic.
-5. Il affiche, masque ou atténue les calques sur la carte, et peut les télécharger pour l'emprise du cadre.
+5. Il affiche, masque ou atténue les calques sur la carte.
 6. Il passe en vue 3D en un clic, ou affiche carte et 3D côte à côte ; le bloc apparaît avec les couches appliquées sur le terrain.
 7. En 3D, il oriente le bloc à la souris ou avec le widget d'axes, règle le soleil et, sur le curseur vertical, l'étirement du relief et la profondeur du socle.
 8. Il exporte une image PNG à fond transparent, sources citées automatiquement.
 
 ## Exigences fonctionnelles
 
-Vingt-sept exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
+Vingt-six exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
 
 | ID | Exigence |
 | --- | --- |
 | VUE-1 | Deux vues, Carte et 3D, bascule en un clic |
 | VUE-2 | Écran partagé : carte et 3D côte à côte |
 | VUE-3 | En écran partagé, vues indépendantes : la carte reste nord en haut, la 3D s'oriente librement |
-| VUE-4 | Toute modification des couches sur la carte se répercute sur le bloc 3D |
+| VUE-4 | Toute modification des couches sur la carte se répercute sur le bloc 3D ; les calques s'y appliquent du bas vers le haut, les toponymes en dernier |
 | VUE-5 | Bouton 3D grisé tant que le relief n'est pas téléchargé ou le cadre pas tracé, avec une infobulle qui dit ce qui manque |
-| ZON-1 | Recherche de lieu avec autocomplétion (service Géoplateforme) |
+| ZON-1 | Recherche de lieu avec autocomplétion (service Géoplateforme) ; la carte se centre sur le lieu choisi, au niveau de zoom 15 (\~5 km de large) |
 | ZON-2 | Cadre rectangulaire tracé et modifié uniquement sur la carte, côté ≤ 10 km, dimensions affichées |
 | TEL-1 | Une fois le cadre tracé, proposition de télécharger le relief RGE ALTI 5 m des seuls départements nécessaires au cadre, taille annoncée ; un seul bouton « Télécharger », sans case à cocher ni bouton « Plus tard » ; la proposition s'affiche immédiatement, la taille suit dès qu'elle est connue |
 | TEL-2 | Cadre à cheval sur plusieurs départements : on propose le plus petit ensemble d'archives qui couvre le cadre. Une archive contient toutes les dalles de 5 km qui touchent son département ; un département voisin n'est proposé que si une dalle du cadre ne touche aucun département déjà retenu ou installé (ex. Clécy : le Calvados suffit) |
 | TEL-3 | Progression, pause et reprise du téléchargement ; décompression et conversion automatiques |
-| TEL-4 | Téléchargement des calques (photo aérienne, Plan IGN) pour l'emprise du cadre |
 | STO-1 | Écran de gestion : départements et zones téléchargés, taille, suppression, dossier de stockage au choix |
 | GEN-1 | Bloc 3D à 5 m, pleine résolution, construit depuis les données locales |
 | GEN-2 | Socle fermé (faces latérales et dessous) |
@@ -76,10 +75,10 @@ Vingt-sept exigences décrivent la v1 hors couches. Les exigences sur les couche
 | REG-1 | Curseur vertical unique à droite de la vue 3D, à deux poignées : étirement du relief (exagération x1 à x2, défaut proposé x1,5) et profondeur du socle (jusqu'à 1 000 m) |
 | REG-2 | Azimut et hauteur du soleil |
 | REG-3 | Ombres portées du relief |
-| EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 ou 3 840 px de large |
+| EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 (défaut), 3 840, 5 760 ou 7 680 px sur le plus grand côté, dans la limite du GPU |
 | EXP-2 | Crédits des sources incrustés sur l'image (ex. « Source : IGN – Licence Ouverte ») |
-| EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages) |
-| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo), les moins récemment vues effacées en premier |
+| EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages), cadré sur le bloc entier quels que soient le zoom et le déplacement à l'écran |
+| CAR-1 | Tuiles des calques (photo aérienne et Plan IGN vectoriel) mises en cache sur le disque : les niveaux 0 à 10 du Plan IGN sur la France sont gardés en permanence ; les autres tuiles partagent un cache plafonné (500 Mo), les moins récemment vues effacées en premier. Les tuiles drapées sur un bloc y restent aussi : pas de téléchargement des calques à part |
 | CAR-2 | Les niveaux 0 à 10 du Plan IGN vectoriel sur la France métropolitaine (\~95 Mo, dont 89 Mo pour le niveau 10) sont téléchargés une fois, en tâche de fond : vues d'ensemble immédiates et disponibles hors connexion |
 | CAR-3 | Chargement fluide : tuiles visibles prioritaires, chargées du centre de l'écran vers les bords ; niveaux de zoom voisins préchargés ; en attendant, la tuile plus grossière s'affiche, jamais un carré vide ; fond de carte blanc. Plan IGN dessiné en tuiles de 512 px, comme le prévoit son style : détails et toponymes apparaissent un niveau de zoom plus tard, pour une carte moins chargée |
 
@@ -118,7 +117,7 @@ Le relief étant local, la construction du bloc ne dépend pas du réseau ; le t
 | Bascule de vue | Passage Carte ↔ 3D immédiat une fois le bloc construit |
 | Fluidité | Manipulation 3D fluide sur GPU intégré récent ; démarrage rapide de l'app ; carte fluide même quand la Géoplateforme est lente (mesuré à \~100 Ko/s le 26 novembre 2026) |
 | Téléchargement | Taille annoncée avant accord ; reprise après coupure ; conversion des fichiers ASC en un format interne rapide à lire, puis suppression de l'archive |
-| Hors connexion | Relief, couches téléchargés et fond de carte en cache utilisables sans réseau |
+| Hors connexion | Relief téléchargé, fond de carte et tuiles des calques déjà vues, en cache, utilisables sans réseau |
 | Respect des services | Limites d'usage de la Géoplateforme respectées, User-Agent identifiant l'app |
 | Plateformes | Windows, macOS (Apple Silicon et Intel), Linux |
 | Prise en main | Premier bloc obtenu sans aide ; interface en français, textes prêts pour la traduction |
@@ -153,7 +152,7 @@ Sans échéance imposée, le projet avance par jalons ; chacun se termine par un
    - Critère : un testeur non spécialiste obtient et exporte un bloc seul.
 3. **Calques et écran partagé** : d'abord la pile de calques (photo aérienne et Plan IGN vectoriel par catégories) sur la carte, reprise telle quelle par le bloc ; puis bâtiments en 3D, styles, carte et 3D côte à côte.
    - Critère : un changement de couche sur la carte apparaît sur le bloc sans reconstruction complète.
-4. **Hors connexion et imports** : téléchargement des couches pour l'emprise du cadre, écran de gestion du stockage, imports de fichiers.
+4. **Hors connexion et imports** : écran de gestion du stockage, imports de fichiers.
    - Critère : un bloc complet se reconstruit sans réseau.
 5. **Version 1.0** : binaires signés pour les 3 systèmes, publication du code sous GPL-3.0.
    - Critère : installation sans alerte bloquante sur Windows, macOS et Linux.
