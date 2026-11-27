@@ -42,7 +42,11 @@ pub fn sky(heights: &[f32], nx: usize, ny: usize) -> Vec<u8> {
 
 /// Size of the shadow mask for a grid of `nx` × `ny` points.
 pub fn size(nx: usize, ny: usize) -> (usize, usize) {
-    ((nx - 1) / STEP + 1, (ny - 1) / STEP + 1)
+    size_at(nx, ny, STEP)
+}
+
+fn size_at(nx: usize, ny: usize, step: usize) -> (usize, usize) {
+    ((nx - 1) / step + 1, (ny - 1) / step + 1)
 }
 
 /// 255 where the sun reaches the point, 0 where the relief hides it, every STEP points.
@@ -50,7 +54,31 @@ pub fn size(nx: usize, ny: usize) -> (usize, usize) {
 /// `heights` are rows south → north of `nx` points; `sun` points towards the sun
 /// (x east, y up, z south).
 pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3) -> Vec<u8> {
+    cast(heights, nx, ny, sun, STEP)
+}
+
+/// The same, cast every 2 × STEP points then spread over the mask's: four times faster but
+/// softer, for while the sun is dragged.
+pub fn rough(heights: &[f32], nx: usize, ny: usize, sun: Vec3) -> Vec<u8> {
+    let coarse = cast(heights, nx, ny, sun, 2 * STEP);
+    let (cx, cy) = size_at(nx, ny, 2 * STEP);
     let (mx, my) = size(nx, ny);
+    // Mask points fall on coarse ones, or halfway between two: their average.
+    let mut out = Vec::with_capacity(mx * my);
+    for j in 0..my {
+        let row = |r: usize| &coarse[r.min(cy - 1) * cx..][..cx];
+        let (a, b) = (row(j / 2), row(j / 2 + j % 2));
+        out.extend((0..mx).map(|i| {
+            let (c0, c1) = (i / 2, (i / 2 + i % 2).min(cx - 1));
+            ((a[c0] as u16 + a[c1] as u16 + b[c0] as u16 + b[c1] as u16) / 4) as u8
+        }));
+    }
+    out
+}
+
+/// `mask` every `step` points.
+fn cast(heights: &[f32], nx: usize, ny: usize, sun: Vec3, step: usize) -> Vec<u8> {
+    let (mx, my) = size_at(nx, ny, step);
     let flat = sun.x.hypot(sun.z);
     if sun.y <= 0.0 {
         return vec![0; mx * my];
@@ -71,11 +99,11 @@ pub fn mask(heights: &[f32], nx: usize, ny: usize, sun: Vec3) -> Vec<u8> {
     let index = |a: usize, b: usize| if along_i { b * mx + a } else { a * mx + b };
     let height = |a: usize, b: usize| {
         let (i, j) = if along_i { (a, b) } else { (b, a) };
-        heights[j * STEP * nx + i * STEP]
+        heights[j * step * nx + i * step]
     };
     let slope = db / da.abs();
     // How much lower the shadow line is one step further from the sun, in true metres.
-    let drop = (STEP as f64 * CELL) as f32 * (1.0 + slope * slope).sqrt() * sun.y / flat;
+    let drop = (step as f64 * CELL) as f32 * (1.0 + slope * slope).sqrt() * sun.y / flat;
 
     // Height of the shadow line over each point of the previous line; none before the first.
     let mut prev = vec![f32::NEG_INFINITY; nb];
@@ -129,6 +157,23 @@ mod tests {
         let at = |i: usize| sky[10 * mx + i / STEP];
         assert_eq!(at(0), 255);
         assert!(at(20) < 128, "{}", at(20));
+    }
+
+    #[test]
+    fn rough_shadows_fall_where_sharp_ones_do() {
+        // A 100 m high, 40 m thick wall at the west edge: rough masks skip thinner features.
+        let (nx, ny) = (161, 9);
+        let mut h = vec![0.0; nx * ny];
+        for j in 0..ny {
+            h[j * nx..j * nx + 9].fill(100.0);
+        }
+        let sun = Vec3::new(-1.0, 1.0, 0.0).normalize();
+        let (sharp, rough) = (mask(&h, nx, ny, sun), rough(&h, nx, ny, sun));
+        assert_eq!(sharp.len(), rough.len());
+        let mx = size(nx, ny).0;
+        // 40 m into the shadow (it reaches 140 m), and well past its end.
+        assert_eq!((sharp[mx + 8], rough[mx + 8]), (0, 0));
+        assert_eq!((sharp[mx + 30], rough[mx + 30]), (255, 255));
     }
 
     #[test]

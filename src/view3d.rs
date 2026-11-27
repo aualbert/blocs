@@ -107,10 +107,12 @@ pub struct View3d {
     sun: Sun,
     /// The block's turn on the map, anticlockwise: the sun and the axes stay on the compass.
     angle: f32,
-    /// The block's heights, and the sun its shadows were cast for: on the true relief,
-    /// so that stretching it leaves them alone.
+    /// The block's heights, and the sun its shadows were cast for, and whether sharp: on
+    /// the true relief, so that stretching it leaves them alone.
     heights: Vec<f32>,
-    shadows_for: Option<Vec3>,
+    shadows_for: Option<(Vec3, bool)>,
+    /// The sun is being dragged: its shadows are cast rough, which is faster.
+    sun_dragged: bool,
     /// The on-screen image and its egui id, remade when the view changes size.
     screen: Option<(Arc<Target>, egui::TextureId)>,
 }
@@ -207,19 +209,28 @@ impl View3d {
             angle: angle as f32,
             heights: map.heights.clone(),
             shadows_for: None,
+            sun_dragged: false,
             screen: None,
         }
     }
 
-    /// Casts the relief's shadows again if the sun moved.
-    fn update_shadows(&mut self, rs: &egui_wgpu::RenderState) {
+    /// Casts the relief's shadows again if the sun moved: rough while it is dragged, sharp
+    /// once let go. True while they are rough, so that a next frame sharpens them.
+    fn update_shadows(&mut self, rs: &egui_wgpu::RenderState) -> bool {
         let sun = self.to_block(self.sun.dir());
-        if self.shadows_for == Some(sun) {
-            return;
+        let sharp = !self.sun_dragged;
+        if let Some((cast, was_sharp)) = self.shadows_for
+            && cast == sun
+            && (was_sharp || !sharp)
+        {
+            return !was_sharp;
         }
-        self.shadows_for = Some(sun);
+        self.shadows_for = Some((sun, sharp));
         let (nx, ny) = (self.points.0 as usize, self.points.1 as usize);
-        let mask = shadow::mask(&self.heights, nx, ny, sun);
+        let mask = match sharp {
+            true => shadow::mask(&self.heights, nx, ny, sun),
+            false => shadow::rough(&self.heights, nx, ny, sun),
+        };
         let mut renderer = rs.renderer.write();
         if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() {
             gpu.drawn = None;
@@ -235,6 +246,7 @@ impl View3d {
                 gpu.shadows.size(),
             );
         }
+        !sharp
     }
 
     /// Hands a layer's draped image, with its `mipmaps`, to the GPU.
@@ -325,7 +337,9 @@ impl View3d {
         }
 
         // Draw the block into its image before egui's pass, then show that image.
-        self.update_shadows(rs);
+        if self.update_shadows(rs) {
+            ui.ctx().request_repaint();
+        }
         let size = (rect.size() * ui.pixels_per_point()).round();
         let size = [size.x.max(1.0) as u32, size.y.max(1.0) as u32];
         let target = self.screen_target(rs, size);
@@ -459,6 +473,7 @@ impl View3d {
                 egui::Sense::drag(),
             )
             .on_hover_text(format!("Soleil à {} (heure solaire)", self.sun.describe()));
+        self.sun_dragged = response.dragged();
         if response.dragged()
             && let Some(p) = response.interact_pointer_pos()
         {
