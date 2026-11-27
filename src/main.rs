@@ -677,7 +677,8 @@ impl Blocs {
             return;
         };
         self.map_memory.center_at(lon_lat(place.lon, place.lat));
-        let _ = self.map_memory.set_zoom(13.0);
+        // About 5 km across on a laptop screen.
+        let _ = self.map_memory.set_zoom(15.0);
         self.search = place.label.clone();
         self.places.clear();
     }
