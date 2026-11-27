@@ -478,10 +478,11 @@ impl Blocs {
             return;
         };
         let background = (!self.photo_visible()).then_some((BACKGROUND, None));
-        let wanted: Vec<_> = (self.layers.iter().filter(|l| l.visible))
-            .map(|l| (l.id, l.category))
-            .chain(background)
+        // Bottom first, so the block fills in from its background up to the labels.
+        let visible = self.layers.iter().rev().filter(|l| l.visible);
+        let wanted: Vec<_> = (background.into_iter())
             .chain([(BUILDINGS, None)])
+            .chain(visible.map(|l| (l.id, l.category)))
             .filter(|(id, _)| !self.draped.contains(id) && !self.draping.contains(id))
             .collect();
         let mut plan = Vec::new();
