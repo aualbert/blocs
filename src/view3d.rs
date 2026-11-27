@@ -26,7 +26,7 @@ const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Layer images stacked on the surface, mirrored in terrain.wgsl.
 pub const SLOTS: usize = 9;
 /// Depths offered for the base, in metres.
-pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 10.0..=1000.0;
+pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 10.0..=999.0;
 /// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
 const SAMPLES: u32 = 4;
 
