@@ -173,6 +173,19 @@ fn ink(in: Out) -> f32 {
     return (1.0 - smoothstep(u.params.w - 1.0, u.params.w, nearest)) * in.edge.w;
 }
 
+// Share of the light coming from the whole sky rather than the sun (linear).
+const AMBIENT: f32 = 0.07;
+// That light from above, bluish, and bounced up from the ground, warm.
+const SKY: vec3<f32> = vec3(0.80, 0.88, 1.0);
+const BOUNCE: vec3<f32> = vec3(0.95, 0.88, 0.78);
+
+// The sun's colour (linear): orange on the horizon, white from 30° up, as the sky's glow in
+// view3d.rs `paint_sky`.
+fn sunlight() -> vec3<f32> {
+    let day = clamp(degrees(asin(u.sun.y)) / 30.0, 0.0, 1.0);
+    return mix(vec3(1.0, 0.6, 0.32), vec3(1.0, 0.97, 0.93), day);
+}
+
 @fragment
 fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // Every slot is sampled (empty ones are transparent), keeping control flow uniform.
@@ -191,10 +204,12 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     c = over(c, textureSample(layer8, samp, in.uv), u.opacity[2].x);
     let color = mix(in.color, c, in.surface);
 
-    // The 3D light shades the layers; none of them carries baked shading.
-    let direct = max(dot(normalize(in.normal), u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
-    let light = 0.35 + 0.65 * direct;
-    let lit = color * light * (1.0 - 0.2 * down);
+    // The 3D light shades the layers; none of them carries baked shading. It is summed on
+    // linear colours, then coded back for display, so that shade stays clear.
+    let n = normalize(in.normal);
+    let direct = max(dot(n, u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
+    let light = AMBIENT * mix(BOUNCE, SKY, 0.5 + 0.5 * n.y) + (1.0 - AMBIENT) * sunlight() * direct;
+    let lit = pow(pow(color, vec3(2.2)) * light, vec3(1.0 / 2.2)) * (1.0 - 0.2 * down);
     // Light ink: a faint line, as in pencil.
     return vec4(mix(lit, vec3(0.2), 0.15 * line), 1.0);
 }
