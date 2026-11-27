@@ -461,7 +461,7 @@ impl View3d {
             painter.text(
                 pos,
                 egui::Align2::CENTER_CENTER,
-                axis.0,
+                crate::i18n::tr(axis.0),
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
             );
@@ -491,7 +491,7 @@ impl View3d {
                 ui.scope_id().with("soleil"),
                 egui::Sense::drag(),
             )
-            .on_hover_text(format!("Soleil à {} (heure solaire)", self.sun.describe()));
+            .on_hover_text(tr!("Soleil à {} (heure solaire)", self.sun.describe()));
         self.sun_dragged = response.dragged();
         if response.dragged()
             && let Some(p) = response.interact_pointer_pos()

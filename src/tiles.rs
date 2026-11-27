@@ -148,6 +148,7 @@ impl Store {
             }
             return Ok(bytes);
         }
+        crate::ign::reachable()?;
         let response = http
             .get(self.source.url(id.zoom, id.x, id.y))
             .timeout(crate::ign::SHORT)

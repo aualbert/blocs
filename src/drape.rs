@@ -82,7 +82,7 @@ impl PlanIgn {
         let zoom = zoom.clamp(1.0, store.source.max_zoom() as f64 + 1.0) as u8;
         let tiles = fetch(store, &crate::ign::shared()?, frame, zoom - 1);
         if tiles.is_empty() {
-            return Err("tuiles du Plan IGN indisponibles".into());
+            return Err(tr!("tuiles du Plan IGN indisponibles").into());
         }
         Ok(Self {
             frame: *frame,

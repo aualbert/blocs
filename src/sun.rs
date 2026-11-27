@@ -76,10 +76,10 @@ impl Sun {
         let minutes = (12.0 * 60.0 + self.hour.to_degrees() * 4.0).round() as u32;
         // Days from the spring equinox (20 March), back to it from the autumn one (22 Sept).
         let days = (self.declination / TILT).asin() / TAU * 365.25;
-        format!(
-            "{} h {:02}, {} ou {}",
+        tr!(
+            "{} h {}, {} ou {}",
             minutes / 60,
-            minutes % 60,
+            format!("{:02}", minutes % 60),
             date(78.0 + days),
             date(264.0 - days)
         )
@@ -114,7 +114,7 @@ fn date(day: f32) -> String {
     let mut day = day.round().rem_euclid(365.0) as u32;
     for (name, length) in MONTHS {
         if day < length {
-            return format!("{} {name}", day + 1);
+            return format!("{} {}", day + 1, crate::i18n::tr(name));
         }
         day -= length;
     }

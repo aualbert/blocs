@@ -84,6 +84,7 @@ pub fn disk_use(dep: &str) -> u64 {
 
 /// Archive volumes `(url, bytes)` of the latest 5 m ASC edition for a département (`"D038"`).
 pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
+    crate::ign::reachable()?;
     let http = crate::ign::shared()?;
     pace();
     let feed = http
@@ -95,7 +96,7 @@ pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
     let edition = attr_values(&feed, "<title>", "<")
         .filter(|t| t.contains("_5M_ASC_") && t.contains(dep))
         .max_by_key(|t| t.rsplit('_').next().unwrap_or_default().to_owned())
-        .ok_or(format!("pas de relief 5 m pour {dep}"))?;
+        .ok_or(tr!("pas de relief 5 m pour {}", dep))?;
 
     pace();
     let entries = http
@@ -189,12 +190,12 @@ pub fn install(dep: &str, pause: &AtomicBool, mut progress: impl FnMut(Progress)
                 progress(Progress::Download { done, total });
             });
             if pause.load(Ordering::Relaxed) {
-                return Err("téléchargement en pause".into());
+                return Err(tr!("téléchargement en pause").into());
             }
             retries = if done > before { 0 } else { retries + 1 };
             if retries >= 5 {
                 result?;
-                return Err("le téléchargement n'avance plus".into());
+                return Err(tr!("le téléchargement n'avance plus").into());
             }
         }
         start += len;
@@ -250,11 +251,11 @@ fn parse_asc(text: &str) -> Result<((i64, i64), Vec<u16>)> {
     let mut header = [0.0; 6]; // ncols nrows xllcorner yllcorner cellsize nodata
     for value in &mut header {
         words.next(); // key
-        *value = words.next().ok_or("en-tête tronqué")?.parse()?;
+        *value = words.next().ok_or(tr!("en-tête tronqué"))?.parse()?;
     }
     let [ncols, nrows, xll, yll, cellsize, nodata] = header;
     if (ncols, nrows, cellsize) != (TILE as f64, TILE as f64, CELL) {
-        return Err(format!("dalle inattendue {ncols}×{nrows} au pas {cellsize}").into());
+        return Err(tr!("dalle inattendue {}×{} au pas {}", ncols, nrows, cellsize).into());
     }
     // xll/yll are cell corners; points sit at cell centres.
     let key = (
@@ -266,7 +267,7 @@ fn parse_asc(text: &str) -> Result<((i64, i64), Vec<u16>)> {
     for row in (0..TILE).rev() {
         // The file starts with the northern row.
         for h in &mut tile[row * TILE..(row + 1) * TILE] {
-            let v: f64 = words.next().ok_or("dalle tronquée")?.parse()?;
+            let v: f64 = words.next().ok_or(tr!("dalle tronquée"))?.parse()?;
             if v != nodata {
                 *h = ((v + 500.0) * 10.0).round().clamp(0.0, (NODATA - 1) as f64) as u16;
             }
@@ -323,7 +324,7 @@ impl Heightmap {
 
         let holes = grid.iter().filter(|&&v| v == NODATA).count();
         if holes == grid.len() {
-            return Err("aucun relief téléchargé ici".into());
+            return Err(tr!("aucun relief téléchargé ici").into());
         }
         let mut heights: Vec<f32> = grid
             .iter()
@@ -442,7 +443,7 @@ fn fetch(
         .error_for_status()?;
     // A whole file sent again would be appended to the part already there.
     if offset > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err("le serveur ne reprend pas le téléchargement".into());
+        return Err(tr!("le serveur ne reprend pas le téléchargement").into());
     }
     let mut buf = vec![0; 1 << 16];
     loop {

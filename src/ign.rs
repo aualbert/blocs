@@ -1,6 +1,7 @@
 //! Géoplateforme web services: place search and département lookup.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -31,6 +32,31 @@ pub fn shared() -> Result<reqwest::blocking::Client> {
     Ok(SHARED.get_or_init(|| http).clone())
 }
 
+/// Set when the Géoplateforme did not answer at start-up: the app then sticks to its
+/// cache, and asks the network nothing more until it answers a check again.
+static OFFLINE: AtomicBool = AtomicBool::new(false);
+
+/// Fails at once, before any request, when the app started offline.
+pub fn reachable() -> Result<()> {
+    match OFFLINE.load(Ordering::Relaxed) {
+        true => Err(tr!("hors connexion").into()),
+        false => Ok(()),
+    }
+}
+
+/// Whether the Géoplateforme answers at all, whatever its reply; if not, the app goes offline.
+pub fn online() -> bool {
+    let head = |http: reqwest::blocking::Client| {
+        let request = http
+            .head("https://data.geopf.fr/")
+            .timeout(Duration::from_secs(5));
+        request.send().is_ok()
+    };
+    let online = shared().is_ok_and(head);
+    OFFLINE.store(!online, Ordering::Relaxed);
+    online
+}
+
 /// A search suggestion and its WGS84 position.
 pub struct Place {
     pub label: String,
@@ -40,6 +66,7 @@ pub struct Place {
 
 /// Autocompletion on addresses and named places.
 pub fn search(text: &str) -> Result<Vec<Place>> {
+    reachable()?;
     let json: Value = serde_json::from_str(
         &shared()?
             .get("https://data.geopf.fr/geocodage/completion")
@@ -67,6 +94,7 @@ pub fn departments(
     http: &reqwest::blocking::Client,
     [x0, y0, x1, y1]: [f64; 4],
 ) -> Result<Vec<String>> {
+    reachable()?;
     // An exact geometry test: the WFS BBOX filter only compares envelopes.
     let filter = format!(
         "INTERSECTS(geometrie,SRID=2154;POLYGON(({x0} {y0},{x1} {y0},{x1} {y1},{x0} {y1},{x0} {y0})))"

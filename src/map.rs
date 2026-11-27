@@ -117,9 +117,9 @@ impl Frame {
     }
 }
 
-/// Metres as kilometres with a French decimal comma.
+/// Metres as kilometres, with the language's decimal mark.
 pub fn km(m: f64) -> String {
-    format!("{:.1}", m / 1000.0).replace('.', ",")
+    crate::i18n::decimal(format!("{:.1}", m / 1000.0))
 }
 
 /// Moves the map by `delta` screen pixels; `start` is the centre until the map is first moved.

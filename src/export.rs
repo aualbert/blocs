@@ -16,9 +16,10 @@ pub fn credits(relief: bool, plan_ign: bool, photo: bool, date: &str) -> String 
     .into_iter()
     .filter_map(|(seen, name)| seen.then_some(name))
     .collect();
-    format!(
-        "Source : IGN – {} – Licence Ouverte 2.0 – consulté le {date}",
-        sources.join(", ")
+    tr!(
+        "Source : IGN – {} – Licence Ouverte 2.0 – consulté le {}",
+        sources.join(", "),
+        date
     )
 }
 

@@ -1,3 +1,7 @@
+// First, so that its `tr!` macro reaches every module.
+#[macro_use]
+mod i18n;
+
 mod buildings;
 mod drape;
 mod export;
@@ -22,6 +26,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use walkers::{Map, MapMemory, lon_lat};
 
+use i18n::Lang;
 use ign::Place;
 use layers::Source;
 use map::{Edit, Frame, FrameTool};
@@ -36,6 +41,9 @@ const START: (f64, f64) = (2.35, 46.6);
 /// starting speed as a share of the pointer's, and decay time (s).
 const GLIDE_SPEED: f32 = 1.0;
 const GLIDE_TAU: f32 = 0.12;
+/// Offline, waits between connection checks: the first, then doubled up to the last.
+const RECHECK_FIRST: Duration = Duration::from_secs(10);
+const RECHECK_MAX: Duration = Duration::from_secs(600);
 /// How long a job's outcome stays shown, in seconds.
 const NOTE_SECS: f32 = 10.0;
 /// Export sizes offered: the image's longer side, in pixels.
@@ -44,6 +52,10 @@ const EXPORT_WIDTHS: [u32; 5] = [1280, 1920, 3840, 5760, 7680];
 /// Messages from background work to the UI.
 enum Msg {
     Status(String),
+    /// Shown until closed.
+    Warning(String),
+    /// The connection is back after a start offline.
+    Online,
     Places(String, Vec<Place>),
     /// For a frame: the départements to download.
     Departments(Frame, Vec<String>),
@@ -152,8 +164,9 @@ struct Blocs {
     ctx: egui::Context,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    /// How the last job ended, and when: shown for `NOTE_SECS`.
-    status: Option<(String, Instant)>,
+    /// How the last job ended, when, and whether it warns: shown for `NOTE_SECS`, or
+    /// until closed for a warning.
+    status: Option<(String, Instant, bool)>,
 
     /// The layer stack, top first: Plan IGN categories, then the photo.
     layers: Vec<MapLayer>,
@@ -249,7 +262,7 @@ impl Blocs {
             category: None,
         });
         let background = styled(None);
-        Self {
+        let app = Self {
             ctx: cc.egui_ctx.clone(),
             tx,
             rx,
@@ -293,12 +306,30 @@ impl Blocs {
             exporting: false,
             storage: None,
             cache_mb: (tiles::cache_limit() / 1_000_000) as u32,
-        }
+        };
+        app.spawn(|send| {
+            if ign::online() {
+                return;
+            }
+            let text =
+                tr!("Pas de connexion à Internet : seules les données en cache sont disponibles.");
+            send(Msg::Warning(text.into()));
+            // Offline, look again after 10 s, 20 s, 40 s…, until the connection is back.
+            let mut wait = RECHECK_FIRST;
+            loop {
+                std::thread::sleep(wait);
+                if ign::online() {
+                    return send(Msg::Online);
+                }
+                wait = (wait * 2).min(RECHECK_MAX);
+            }
+        });
+        app
     }
 
     /// Shows `text` in the activity stack for `NOTE_SECS`.
     fn note(&mut self, text: String) {
-        self.status = Some((text, Instant::now()));
+        self.status = Some((text, Instant::now(), false));
     }
 
     /// Runs `work` on a thread; its messages wake the UI.
@@ -316,6 +347,13 @@ impl Blocs {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Status(text) => self.note(text),
+                Msg::Warning(text) => self.status = Some((text, Instant::now(), true)),
+                Msg::Online => {
+                    self.note(tr!("Connexion rétablie.").into());
+                    // Ask again what offline left out: the frame's départements, the block's layers.
+                    self.in_frame = Lookup::default();
+                    self.draped.clear();
+                }
                 Msg::Storage(storage) => {
                     // A relief was deleted: look the frame's départements up again.
                     let deps: Vec<_> = storage.reliefs.iter().map(|r| r.1.clone()).collect();
@@ -346,18 +384,19 @@ impl Blocs {
                     let name = ign::department_name(&dep);
                     self.download.converting = matches!(p, Progress::Convert { .. });
                     self.download.text = match p {
-                        Progress::Download { done, total } => format!(
-                            "{name} : téléchargement {} / {} Mo",
+                        Progress::Download { done, total } => tr!(
+                            "{} : téléchargement {} / {} Mo",
+                            name,
                             done / 1_000_000,
                             total / 1_000_000
                         ),
                         Progress::Convert { done, total } => {
-                            format!("{name} : préparation {done} / {total} dalles")
+                            tr!("{} : préparation {} / {} dalles", name, done, total)
                         }
                     };
                 }
                 Msg::Installed(dep) => {
-                    self.note(format!("Relief installé : {}.", ign::department_name(&dep)));
+                    self.note(tr!("Relief installé : {}.", ign::department_name(&dep)));
                     self.download.queue.retain(|d| *d != dep);
                     self.download.running = false;
                     self.installed = relief::installed();
@@ -380,7 +419,7 @@ impl Blocs {
                     self.download.running = false;
                     if !self.download.pause.load(Ordering::Relaxed) {
                         self.download.pause.store(true, Ordering::Relaxed);
-                        self.note(format!("Téléchargement interrompu : {error}"));
+                        self.note(tr!("Téléchargement interrompu : {}", error));
                     }
                 }
                 Msg::Draped(built, id, result) => {
@@ -401,7 +440,7 @@ impl Blocs {
                         Err(e) => {
                             // Not retried for this block: moving the frame or reopening asks again.
                             self.draped.insert(id);
-                            self.note(format!("Calque indisponible sur le bloc : {e}"));
+                            self.note(tr!("Calque indisponible sur le bloc : {}", e));
                         }
                     }
                 }
@@ -433,7 +472,7 @@ impl Blocs {
                             self.built = Some(built);
                             self.view = View::Split;
                         }
-                        Err(e) => self.note(format!("Échec : {e}")),
+                        Err(e) => self.note(tr!("Échec : {}", e)),
                     }
                 }
             }
@@ -447,13 +486,16 @@ impl Blocs {
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         self.spawn(move |send| {
             // Offline, nothing to offer: the block is built from what is installed.
+            if ign::reachable().is_err() {
+                return send(Msg::Departments(frame, Vec::new()));
+            }
             let fail = |text: String| {
                 send(Msg::Status(text));
                 send(Msg::Departments(frame, Vec::new()));
             };
             let http = match ign::shared() {
                 Ok(http) => http,
-                Err(e) => return fail(format!("Réseau indisponible : {e}")),
+                Err(e) => return fail(tr!("Réseau indisponible : {}", e)),
             };
             // Which départements touch each dalle of the frame, asked in parallel.
             let dalles = relief::dalles(frame.bounds());
@@ -469,7 +511,7 @@ impl Blocs {
             });
             let answers = match answers.into_iter().collect::<relief::Result<Vec<_>>>() {
                 Ok(answers) => answers,
-                Err(e) => return fail(format!("Départements introuvables : {e}")),
+                Err(e) => return fail(tr!("Départements introuvables : {}", e)),
             };
             let needed = relief::cover(&answers, &installed);
             send(Msg::Departments(frame, needed.clone()));
@@ -649,7 +691,7 @@ impl Blocs {
         let Some(path) = rfd::FileDialog::new()
             .set_parent(frame)
             .set_file_name("bloc.png")
-            .add_filter("Image PNG", &["png"])
+            .add_filter(tr!("Image PNG"), &["png"])
             .save_file()
         else {
             return;
@@ -671,8 +713,8 @@ impl Blocs {
         self.spawn(move |send| {
             send(Msg::Exported(
                 match export::save_png(&path, w, h, rgba, &credits) {
-                    Ok(()) => format!("Image enregistrée : {}", path.display()),
-                    Err(e) => format!("Échec de l'export : {e}"),
+                    Ok(()) => tr!("Image enregistrée : {}", path.display()),
+                    Err(e) => tr!("Échec de l'export : {}", e),
                 },
             ))
         });
@@ -682,7 +724,7 @@ impl Blocs {
         ui.horizontal(|ui| {
             let search = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
-                    .hint_text("Rechercher un lieu…")
+                    .hint_text(tr!("Rechercher un lieu…"))
                     .desired_width(220.0),
             );
             if search.changed() {
@@ -696,14 +738,15 @@ impl Blocs {
             // Greyed out without the map, so that the bar keeps its layout.
             ui.add_enabled_ui(self.view != View::Block, |ui| {
                 // A button, grey like the others, highlighted while drawing.
-                let button = egui::Button::new("Tracer le cadre").selected(self.drawing);
-                let tip = "Glissez sur la carte pour tracer le cadre (10 km au plus par côté).";
+                let button = egui::Button::new(tr!("Tracer le cadre")).selected(self.drawing);
+                let tip =
+                    tr!("Glissez sur la carte pour tracer le cadre (10 km au plus par côté).");
                 if ui.add(button).on_hover_text(tip).clicked() {
                     self.drawing = !self.drawing;
                 }
             });
             self.options(ui);
-            egui::containers::menu::MenuButton::new("Aide").ui(ui, help);
+            egui::containers::menu::MenuButton::new(tr!("Aide")).ui(ui, help);
         });
     }
 
@@ -711,13 +754,13 @@ impl Blocs {
     fn view_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             let (other, text) = match self.view {
-                View::Map => (View::Block, "Vue 3D"),
-                _ => (View::Map, "Carte"),
+                View::Map => (View::Block, tr!("Vue 3D")),
+                _ => (View::Map, tr!("Carte")),
             };
             if ui.button(text).clicked() {
                 self.view = other;
             }
-            if ui.button("Vue double").clicked() {
+            if ui.button(tr!("Vue double")).clicked() {
                 self.view = View::Split;
             }
         });
@@ -789,7 +832,11 @@ impl Blocs {
         let pausable = paused || !self.download.converting;
         if pausable
             && ui
-                .button(if paused { "Reprendre" } else { "Pause" })
+                .button(if paused {
+                    tr!("Reprendre")
+                } else {
+                    tr!("Pause")
+                })
                 .clicked()
         {
             if paused {
@@ -800,10 +847,10 @@ impl Blocs {
         }
         let mut text = self.download.text.clone();
         if self.download.queue.len() > 1 {
-            text += &format!(" · {} en attente", self.download.queue.len() - 1);
+            text += &tr!(" · {} en attente", self.download.queue.len() - 1);
         }
         if paused {
-            text += " · en pause";
+            text += tr!(" · en pause");
         }
         ui.label(text);
     }
@@ -823,15 +870,15 @@ impl Blocs {
         if !proposal.is_empty() {
             line(ui, |ui| {
                 let names: Vec<_> = proposal.iter().map(|d| ign::department_name(d)).collect();
-                ui.label(format!("Relief à télécharger : {}", names.join(", ")));
+                ui.label(tr!("Relief à télécharger : {}", names.join(", ")));
                 // The total shows once every size is known.
                 let sizes: Option<Vec<u64>> = proposal
                     .iter()
                     .map(|d| self.sizes.get(d).copied())
                     .collect();
                 let label = match sizes {
-                    Some(s) => format!("Télécharger ({})", megabytes(s.iter().sum())),
-                    None => "Télécharger".into(),
+                    Some(s) => tr!("Télécharger ({})", megabytes(s.iter().sum())),
+                    None => tr!("Télécharger").into(),
                 };
                 if ui.button(label).clicked() {
                     self.download.queue.extend(proposal);
@@ -840,33 +887,40 @@ impl Blocs {
             });
         }
         if self.in_frame.frame.is_some() && self.in_frame.codes.is_none() {
-            busy(ui, "Recherche des départements du cadre…");
+            busy(ui, tr!("Recherche des départements du cadre…"));
         }
         if self.building {
-            busy(ui, "Construction du bloc…");
+            busy(ui, tr!("Construction du bloc…"));
         }
         if !self.draping.is_empty() {
             let names: Vec<_> = (self.layers.iter())
                 .map(|l| (l.id, l.name))
                 .chain([(BACKGROUND, "Fond du Plan IGN"), (BUILDINGS, "Bâtiments")])
                 .filter(|(id, _)| self.draping.contains(id))
-                .map(|(_, name)| name)
+                .map(|(_, name)| i18n::tr(name))
                 .collect();
-            busy(ui, &format!("Préparation : {}", names.join(", ")));
+            busy(ui, &tr!("Préparation : {}", names.join(", ")));
         }
         if self.exporting {
-            busy(ui, "Enregistrement de l'image…");
+            busy(ui, tr!("Enregistrement de l'image…"));
         }
         if let Some((done, total)) = self.plan_tiles.seed_progress() {
             line(ui, |ui| {
-                ui.label(format!("Plan IGN de base : {done} / {total} tuiles"));
+                ui.label(tr!("Plan IGN de base : {} / {} tuiles", done, total));
             });
             // Its tiles arrive without waking the UI.
             ui.ctx().request_repaint_after_secs(1.0);
         }
-        if let Some((text, at)) = self.status.clone() {
-            // Fades out over its last second, or goes at once on "x".
-            let left = NOTE_SECS - at.elapsed().as_secs_f32();
+        if let Some((text, at, warn)) = self.status.clone() {
+            // Fades out over its last second, or goes at once on "x"; a warning waits for "x".
+            let left = match warn {
+                true => NOTE_SECS,
+                false => NOTE_SECS - at.elapsed().as_secs_f32(),
+            };
+            let text = match warn {
+                true => egui::RichText::new(text).color(ui.visuals().warn_fg_color),
+                false => text.into(),
+            };
             let mut close = left <= 0.0;
             ui.scope(|ui| {
                 ui.set_opacity(left.clamp(0.0, 1.0));
@@ -888,9 +942,11 @@ impl Blocs {
         // Stays open while deleting or sliding; a click elsewhere closes it.
         let config =
             MenuConfig::new().close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-        let (button, _) = MenuButton::new("Options")
-            .config(config)
-            .ui(ui, |ui| self.options_menu(ui));
+        let (button, _) = MenuButton::new(tr!("Options")).config(config).ui(ui, |ui| {
+            self.options_menu(ui);
+            ui.separator();
+            language(ui);
+        });
         if button.clicked() {
             self.measure(|| ());
         }
@@ -921,9 +977,9 @@ impl Blocs {
         // What a click asks for, run after the menu is drawn.
         let mut job: Option<Box<dyn FnOnce() + Send>> = None;
 
-        ui.strong("Relief téléchargé");
+        ui.strong(tr!("Relief téléchargé"));
         if storage.reliefs.is_empty() {
-            ui.label("Aucun département.");
+            ui.label(tr!("Aucun département."));
         }
         // Past 10 départements, the list scrolls rather than lengthening the menu.
         let row = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
@@ -949,16 +1005,16 @@ impl Blocs {
             });
         ui.separator();
 
-        ui.strong("Plan IGN de base");
+        ui.strong(tr!("Plan IGN de base"));
         ui.horizontal(|ui| {
             if confirmed(ui, "plan", true) {
                 job = Some(Box::new(|| tiles::delete(true)));
             }
-            ui.label(format!("{} · téléchargé au lancement", megabytes(seed)));
+            ui.label(tr!("{} · téléchargé au lancement", megabytes(seed)));
         });
         ui.separator();
 
-        ui.strong("Cache des tuiles");
+        ui.strong(tr!("Cache des tuiles"));
         ui.horizontal(|ui| {
             if confirmed(ui, "cache", true) {
                 job = Some(Box::new(|| tiles::delete(false)));
@@ -968,8 +1024,8 @@ impl Blocs {
         let slider = ui.add(
             egui::Slider::new(&mut self.cache_mb, 100..=5000)
                 .logarithmic(true)
-                .suffix(" Mo")
-                .text("au plus"),
+                .suffix(format!(" {}", tr!("Mo")))
+                .text(tr!("au plus")),
         );
         // Saved once the handle is let go, which trims the cache if needed.
         if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
@@ -984,9 +1040,9 @@ impl Blocs {
     /// The layers, top first, each shown or hidden, with its opacity. Their order is
     /// IGN's cartographic one, the photo always at the bottom.
     fn layers_panel(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Calques");
+        ui.strong(tr!("Calques"));
         if self.map_memory.zoom() < layers::STACK_ZOOM as f64 {
-            ui.weak("Zoomez pour afficher les calques.");
+            ui.weak(tr!("Zoomez pour afficher les calques."));
         }
         // A fixed width, so the sliders line up on the right edge.
         ui.set_width(CARD_WIDTH);
@@ -1025,7 +1081,7 @@ impl Blocs {
         // As wide as the layer card: the title, then the export flush right.
         ui.set_width(CARD_WIDTH);
         ui.horizontal(|ui| {
-            ui.strong("Bloc");
+            ui.strong(tr!("Bloc"));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Right to left: the size, then the button before it.
                 egui::ComboBox::from_id_salt("largeur")
@@ -1037,8 +1093,11 @@ impl Blocs {
                         }
                     });
                 let export = ui
-                    .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
-                    .on_hover_text("Image PNG, fond transparent");
+                    .add_enabled(
+                        block && !self.exporting,
+                        egui::Button::new(tr!("Exporter…")),
+                    )
+                    .on_hover_text(tr!("Image PNG, fond transparent"));
                 if export.clicked() {
                     self.export(frame);
                 }
@@ -1056,10 +1115,10 @@ impl Blocs {
         };
         let sliders = ui.add_enabled_ui(block, |ui| {
             egui::Grid::new("bloc").show(ui, |ui| {
-                ui.label("Relief");
+                ui.label(tr!("Relief"));
                 ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
                 ui.end_row();
-                ui.label("Socle");
+                ui.label(tr!("Socle"));
                 ui.add(
                     egui::Slider::new(base_depth, view3d::BASE_DEPTHS)
                         .logarithmic(true)
@@ -1293,11 +1352,12 @@ fn card<R>(
 /// A layer's toggle, then its opacity slider, if any, at the row's right end.
 fn layer_row(ui: &mut egui::Ui, visible: &mut bool, opacity: Option<&mut f32>, name: &str) {
     ui.horizontal(|ui| {
-        ui.checkbox(visible, name);
+        ui.checkbox(visible, i18n::tr(name));
         let Some(opacity) = opacity else { return };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let slider = egui::Slider::new(opacity, 0.0..=1.0).show_value(false);
-            ui.add_enabled(*visible, slider).on_hover_text("Opacité");
+            ui.add_enabled(*visible, slider)
+                .on_hover_text(tr!("Opacité"));
         });
     });
 }
@@ -1311,12 +1371,16 @@ fn line(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
 fn help(ui: &mut egui::Ui) {
     let sections = [
         (
-            "Carte",
-            "Glisser : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas",
+            tr!("Carte"),
+            tr!(
+                "Glisser : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas"
+            ),
         ),
         (
-            "Vue 3D",
-            "Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas",
+            tr!("Vue 3D"),
+            tr!(
+                "Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas"
+            ),
         ),
     ];
     // A little room after the longest lines.
@@ -1339,18 +1403,36 @@ fn help(ui: &mut egui::Ui) {
 fn confirmed(ui: &mut egui::Ui, salt: impl egui::AsIdSalt, enabled: bool) -> bool {
     let id = ui.scope_id().with(salt);
     let armed = ui.data(|d| d.get_temp(id)).unwrap_or(false);
-    let label = if armed { "Confirmer" } else { "Supprimer" };
+    let label = if armed {
+        tr!("Confirmer")
+    } else {
+        tr!("Supprimer")
+    };
     let response = ui.add_enabled(enabled, egui::Button::new(label));
     let clicked = response.clicked();
     ui.data_mut(|d| d.insert_temp(id, response.hovered() && (armed != clicked)));
     armed && clicked
 }
 
+/// The language picker, at the bottom of the options: its title, then a toggle per
+/// language on the same line, each in its own words.
+fn language(ui: &mut egui::Ui) {
+    let mut lang = i18n::lang();
+    ui.horizontal(|ui| {
+        ui.strong(tr!("Langue"));
+        ui.selectable_value(&mut lang, Lang::Fr, "Français");
+        ui.selectable_value(&mut lang, Lang::En, "English");
+    });
+    if lang != i18n::lang() {
+        i18n::set(lang);
+    }
+}
+
 fn megabytes(bytes: u64) -> String {
     if bytes >= 1_000_000_000 {
-        format!("{:.1} Go", bytes as f64 / 1e9).replace('.', ",")
+        i18n::decimal(format!("{:.1} {}", bytes as f64 / 1e9, tr!("Go")))
     } else {
-        format!("{} Mo", bytes / 1_000_000)
+        format!("{} {}", bytes / 1_000_000, tr!("Mo"))
     }
 }
 
@@ -1398,6 +1480,7 @@ fn main() -> eframe::Result {
     // long dashes); arboard on GNOME about its clipboard fallback.
     let filter = env_logger::Env::default().default_filter_or("warn,walkers=error,arboard=error");
     env_logger::Builder::from_env(filter).init();
+    i18n::load();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["bloc", lon, lat] => {
