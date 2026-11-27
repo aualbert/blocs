@@ -4,8 +4,9 @@ struct Uniforms {
     view_proj: mat4x4<f32>,
     params: vec4<f32>, // exaggeration, base depth (m), cell (m), line width (px)
     grid: vec4<f32>,   // points east, points north, min height, max height (m)
-    sun: vec4<f32>,    // direction towards the sun
+    sun: vec4<f32>,    // direction towards the sun; w: 1 with the buildings' shadows
     opacity: array<vec4<f32>, 3>, // per layer slot (SLOTS), bottom first
+    sun_view_proj: mat4x4<f32>, // the block seen from the sun, for the buildings' shadows
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -26,6 +27,9 @@ struct Uniforms {
 const SHADOW_STEP: f32 = 2.0;
 // Share of the sky each point sees (shadow.rs), on the shadows' grid.
 @group(0) @binding(13) var sky_seen: texture_2d<f32>;
+// The buildings seen from the sun (their depth), for their shadows.
+@group(0) @binding(14) var sun_depth: texture_depth_2d;
+@group(0) @binding(15) var sun_compare: sampler_comparison;
 
 // Vertex kinds, see view3d.rs.
 const SURFACE: u32 = 0u;
@@ -113,14 +117,8 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
     return out;
 }
 
-// Building corners, see buildings.rs: true heights over the exaggerated ground.
-@vertex
-fn vs_building(
-    @location(0) grid: vec2<f32>,
-    @location(1) ground: f32,
-    @location(2) roof: f32,
-    @location(3) normal: vec2<f32>,
-) -> Out {
+// A building corner's position, see buildings.rs: true heights over the exaggerated ground.
+fn building_corner(grid: vec2<f32>, ground: f32, roof: f32) -> vec3<f32> {
     let exag = u.params.x;
     let half = (u.grid.xy - 1.0) * 0.5;
     var y = (ground - u.grid.z) * exag + roof;
@@ -131,8 +129,27 @@ fn vs_building(
         let t = min(min(height(i, j), height(i + 1, j)), min(height(i, j + 1), height(i + 1, j + 1)));
         y = (min(t, ground) - u.grid.z) * exag;
     }
-    let p = vec3((grid.x - half.x) * u.params.z, y, (half.y - grid.y) * u.params.z);
+    return vec3((grid.x - half.x) * u.params.z, y, (half.y - grid.y) * u.params.z);
+}
 
+// The buildings seen from the sun, depth only: what their shadows are read from.
+@vertex
+fn vs_building_sun(
+    @location(0) grid: vec2<f32>,
+    @location(1) ground: f32,
+    @location(2) roof: f32,
+) -> @builtin(position) vec4<f32> {
+    return u.sun_view_proj * vec4(building_corner(grid, ground, roof), 1.0);
+}
+
+@vertex
+fn vs_building(
+    @location(0) grid: vec2<f32>,
+    @location(1) ground: f32,
+    @location(2) roof: f32,
+    @location(3) normal: vec2<f32>,
+) -> Out {
+    let p = building_corner(grid, ground, roof);
     var out: Out;
     out.pos = u.view_proj * vec4(p, 1.0);
     out.world = p;
@@ -149,6 +166,17 @@ fn vs_building(
 // Lays one layer (premultiplied alpha) over the colour below, as the map does.
 fn over(below: vec3<f32>, layer: vec4<f32>, opacity: f32) -> vec3<f32> {
     return below * (1.0 - layer.a * opacity) + layer.rgb * opacity;
+}
+
+// Share of the sun the buildings leave at `p`, `n` its normal: 0 in their shadow. Read a
+// little off the surface, so that a building does not shade itself.
+fn clear_of_buildings(p: vec3<f32>, n: vec3<f32>) -> f32 {
+    if u.sun.w == 0.0 {
+        return 1.0;
+    }
+    let s = u.sun_view_proj * vec4(p + n * 0.5, 1.0);
+    let uv = vec2(0.5 + 0.5 * s.x, 0.5 - 0.5 * s.y);
+    return textureSampleCompareLevel(sun_depth, sun_compare, uv, s.z);
 }
 
 // Position of `p` on the shadows' grid, 0..1.
@@ -216,7 +244,8 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     // The 3D light shades the layers; none of them carries baked shading. It is summed on
     // linear colours, then coded back for display, so that shade stays clear.
     let n = normalize(in.normal);
-    let direct = max(dot(n, u.sun.xyz), 0.0) * mix(1.0, sunlit(in.world), in.shaded);
+    let shade = sunlit(in.world) * clear_of_buildings(in.world, n);
+    let direct = max(dot(n, u.sun.xyz), 0.0) * mix(1.0, shade, in.shaded);
     // The sky's light, from what of it each point sees; where the relief hides it, the
     // relief's own light, dimmer and warm. The sun's light is left alone.
     let seen = mix(1.0, textureSampleLevel(sky_seen, samp, on_mask(in.world), 0.0).r, in.shaded);

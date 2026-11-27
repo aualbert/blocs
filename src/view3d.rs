@@ -30,6 +30,12 @@ pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 1.0..=999.0;
 /// Width of the block-diagram lines on its walls, in points on screen. An export scales it
 /// with its size, as on a view about 1200 points wide.
 const LINE: f32 = 1.5;
+/// Side of the image of the buildings seen from the sun, in pixels: about 2.4 m each on a
+/// 10 km block, finer on smaller ones.
+const SUN_MAP: u32 = 4096;
+const SUN_DEPTH: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Room above the relief for the tallest buildings, in the sun's view (m).
+const TALLEST: f32 = 300.0;
 /// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
 const SAMPLES: u32 = 4;
 
@@ -56,6 +62,8 @@ struct Uniforms {
     sun: [f32; 4],
     /// Opacity of each layer slot, bottom first; 0 for empty slots.
     opacity: [[f32; 4]; 3],
+    /// The block seen from the sun, for the buildings' shadows.
+    sun_view_proj: [[f32; 4]; 4],
 }
 
 /// GPU objects for the current block, kept in egui's callback resources.
@@ -81,6 +89,14 @@ struct Gpu {
     /// Buildings pipeline, and their vertices, indices and index count once known.
     building_pipeline: wgpu::RenderPipeline,
     buildings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// The buildings seen from the sun (depth only), drawn first, and what their shadows
+    /// are read with; 1 × 1 until there are buildings.
+    sun_pipeline: wgpu::RenderPipeline,
+    sun_bind_group: wgpu::BindGroup,
+    sun_depth: wgpu::TextureView,
+    sun_compare: wgpu::Sampler,
+    /// The sun's view the buildings were last drawn in, kept until it changes.
+    sun_cast: Option<[[f32; 4]; 4]>,
     /// The uniforms and on-screen image last drawn, so that an unchanged block is not drawn
     /// again; `None` once anything else it shows changes.
     drawn: Option<(Uniforms, u64)>,
@@ -273,7 +289,10 @@ impl View3d {
                         usage,
                     })
             };
-            gpu.drawn = None;
+            let size = SUN_MAP.min(rs.device.limits().max_texture_dimension_2d);
+            gpu.sun_depth = sun_depth(&rs.device, size);
+            gpu.sun_cast = None;
+            gpu.bind(&rs.device, gpu.slots.clone());
             gpu.buildings = Some((
                 buffer(
                     bytemuck::cast_slice(&mesh.vertices),
@@ -558,14 +577,45 @@ impl View3d {
                 self.range.0,
                 self.range.1,
             ],
-            sun: sun.extend(0.0).to_array(),
+            // w: 1 with the buildings' shadows, which wait while the sun is dragged.
+            sun: sun
+                .extend(if self.sun_dragged { 0.0 } else { 1.0 })
+                .to_array(),
             // SLOTS opacities, padded to whole vec4s.
             opacity: {
                 let mut o = [0.0; 12];
                 o[..SLOTS].copy_from_slice(&self.opacity);
                 bytemuck::cast(o)
             },
+            sun_view_proj: self.sun_view_proj(sun).to_cols_array_2d(),
         }
+    }
+
+    /// The block seen from the sun `sun` (block axes), just holding it and its tallest
+    /// buildings: in the block's own axes, as the shader's positions.
+    fn sun_view_proj(&self, sun: Vec3) -> Mat4 {
+        let (hx, hz) = (self.extent.0 / 2.0, self.extent.1 / 2.0);
+        let top = (self.range.1 - self.range.0) * self.exaggeration + TALLEST;
+        // From the lowest relief up: the base walls take no buildings' shadows, and its
+        // slider then leaves this view alone.
+        let centre = Vec3::new(0.0, top / 2.0, 0.0);
+        let radius = Vec3::new(hx, top / 2.0, hz).length();
+        let up = if sun.y.abs() > 0.99 { Vec3::Z } else { Vec3::Y };
+        let view = look_at_mat4(centre + sun * radius * 2.0, centre, up);
+        let mut win = [f32::MAX, f32::MIN, f32::MAX, f32::MIN];
+        for c in 0..8 {
+            let x = if c & 1 == 0 { -hx } else { hx };
+            let y = if c & 2 == 0 { 0.0 } else { top };
+            let z = if c & 4 == 0 { -hz } else { hz };
+            let q = view.transform_point3(Vec3::new(x, y, z));
+            win = [
+                win[0].min(q.x),
+                win[1].max(q.x),
+                win[2].min(q.y),
+                win[3].max(q.y),
+            ];
+        }
+        orthographic(win[0], win[1], win[2], win[3], 0.0, radius * 4.0) * view
     }
 
     /// Renders the whole block, seen as on screen, off-screen on a transparent background,
@@ -586,15 +636,15 @@ impl View3d {
         );
         let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
         let line = (width.max(height) as f32 / 1200.0 * LINE).max(LINE);
-        let renderer = rs.renderer.read();
-        let gpu: &Gpu = renderer.callback_resources.get().expect("bloc chargé");
-        queue.write_buffer(
-            &gpu.uniforms,
-            0,
-            bytemuck::bytes_of(&self.uniforms_in(window, line)),
-        );
+        let mut renderer = rs.renderer.write();
+        let gpu: &mut Gpu = renderer.callback_resources.get_mut().expect("bloc chargé");
         let mut encoder = device.create_command_encoder(&Default::default());
-        gpu.render(&mut encoder, &target);
+        gpu.render(
+            queue,
+            &mut encoder,
+            &target,
+            &self.uniforms_in(window, line),
+        );
         queue.submit([encoder.finish()]);
         let mut rgba = read_texture(device, queue, &target.texture);
         // Antialiased edges come out premultiplied; PNG wants straight alpha.
@@ -638,8 +688,7 @@ impl egui_wgpu::CallbackTrait for Draw {
             // Unchanged since drawn into this image: egui shows it as it is.
             let key = Some((self.uniforms, self.target.id));
             if gpu.drawn != key {
-                queue.write_buffer(&gpu.uniforms, 0, bytemuck::bytes_of(&self.uniforms));
-                gpu.render(encoder, &self.target);
+                gpu.render(queue, encoder, &self.target, &self.uniforms);
                 gpu.drawn = key;
             }
         }
@@ -689,6 +738,14 @@ impl Gpu {
             binding: 4 + SLOTS as u32,
             resource: wgpu::BindingResource::TextureView(&self.sky),
         });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 5 + SLOTS as u32,
+            resource: wgpu::BindingResource::TextureView(&self.sun_depth),
+        });
+        entries.push(wgpu::BindGroupEntry {
+            binding: 6 + SLOTS as u32,
+            resource: wgpu::BindingResource::Sampler(&self.sun_compare),
+        });
         self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &self.layout,
@@ -700,7 +757,45 @@ impl Gpu {
 
     /// Draws the block into `target`, on a transparent background, resolving the samples
     /// into a premultiplied image.
-    fn render(&self, encoder: &mut wgpu::CommandEncoder, target: &Target) {
+    fn render(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &Target,
+        uniforms: &Uniforms,
+    ) {
+        // Without buildings, no shadows of theirs to read.
+        let mut uniforms = *uniforms;
+        if self.buildings.is_none() {
+            uniforms.sun[3] = 0.0;
+        }
+        queue.write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
+        // The buildings seen from the sun first, for their shadows: only when that view
+        // changed, as drawing them again is slow, and not while the sun is dragged.
+        if let Some((vertices, indices, count)) = &self.buildings
+            && uniforms.sun[3] == 1.0
+            && self.sun_cast != Some(uniforms.sun_view_proj)
+        {
+            self.sun_cast = Some(uniforms.sun_view_proj);
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("soleil"),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.sun_depth,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.sun_pipeline);
+            pass.set_bind_group(0, &self.sun_bind_group, &[]);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..*count, 0, 0..1);
+        }
+
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("bloc"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -903,6 +998,30 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, prepared: &Prepared) -> 
             count: None,
         });
     }
+    // The buildings seen from the sun, and how their shadows are read.
+    entries.extend([
+        wgpu::BindGroupLayoutEntry {
+            binding: 5 + SLOTS as u32,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 6 + SLOTS as u32,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+            count: None,
+        },
+    ]);
+    // The sun's pass reads only the uniforms and heights: the first two entries.
+    let sun_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &entries[..2],
+    });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
         entries: &entries,
@@ -973,6 +1092,67 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, prepared: &Prepared) -> 
         },
     );
 
+    // The buildings seen from the sun: their corners, depth only, a little further back
+    // so that they do not shade themselves.
+    let sun_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("vs_building_sun"),
+        layout: Some(
+            &device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(&sun_layout)],
+                immediate_size: 0,
+            }),
+        ),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_building_sun"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: size_of::<buildings::Vertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32, 2 => Float32],
+            })],
+        },
+        fragment: None,
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: SUN_DEPTH,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: wgpu::DepthBiasState {
+                constant: 2,
+                slope_scale: 2.0,
+                clamp: 0.0,
+            },
+        }),
+        multisample: Default::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let heights = texture.create_view(&Default::default());
+    let sun_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &sun_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&heights),
+            },
+        ],
+    });
+    // Filtered: shadow edges come out smooth.
+    let sun_compare = device.create_sampler(&wgpu::SamplerDescriptor {
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        compare: Some(wgpu::CompareFunction::LessEqual),
+        ..Default::default()
+    });
+
     let Prepared {
         vertices, indices, ..
     } = prepared;
@@ -997,7 +1177,7 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, prepared: &Prepared) -> 
         layout,
         bind_group,
         uniforms,
-        heights: texture.create_view(&Default::default()),
+        heights,
         shadows,
         sky: sky.create_view(&Default::default()),
         sampler,
@@ -1017,10 +1197,35 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, prepared: &Prepared) -> 
         index_count: indices.len() as u32,
         building_pipeline,
         buildings: None,
+        sun_pipeline,
+        sun_bind_group,
+        sun_depth: sun_depth(device, 1),
+        sun_compare,
+        sun_cast: None,
         drawn: None,
     };
     gpu.bind(device, Vec::new());
     gpu
+}
+
+/// A square depth image of `size` pixels, for the buildings seen from the sun.
+fn sun_depth(device: &wgpu::Device, size: u32) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("soleil"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SUN_DEPTH,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+        .create_view(&Default::default())
 }
 
 /// The pixels of a 4-byte texture, rows top to bottom, once the GPU work queued so far is done.
