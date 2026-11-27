@@ -5,7 +5,7 @@ struct Uniforms {
     params: vec4<f32>, // exaggeration, base depth (m), cell (m), unused
     grid: vec4<f32>,   // points east, points north, min height, max height (m)
     sun: vec4<f32>,    // direction towards the sun
-    opacity: array<vec4<f32>, 2>, // per layer slot (SLOTS), bottom first
+    opacity: array<vec4<f32>, 3>, // per layer slot (SLOTS), bottom first
 };
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -20,8 +20,9 @@ struct Uniforms {
 @group(0) @binding(8) var layer5: texture_2d<f32>;
 @group(0) @binding(9) var layer6: texture_2d<f32>;
 @group(0) @binding(10) var layer7: texture_2d<f32>;
+@group(0) @binding(11) var layer8: texture_2d<f32>;
 // Where the sun reaches the surface (shadow.rs), and its spacing in grid points.
-@group(0) @binding(11) var shadows: texture_2d<f32>;
+@group(0) @binding(12) var shadows: texture_2d<f32>;
 const SHADOW_STEP: f32 = 2.0;
 
 // Vertex kinds, see view3d.rs.
@@ -165,6 +166,7 @@ fn fs_main(in: Out) -> @location(0) vec4<f32> {
     c = over(c, textureSample(layer5, samp, in.uv), u.opacity[1].y);
     c = over(c, textureSample(layer6, samp, in.uv), u.opacity[1].z);
     c = over(c, textureSample(layer7, samp, in.uv), u.opacity[1].w);
+    c = over(c, textureSample(layer8, samp, in.uv), u.opacity[2].x);
     let color = mix(in.color, c, in.surface);
 
     // The 3D light shades the layers; none of them carries baked shading.

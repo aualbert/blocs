@@ -44,18 +44,20 @@ pub enum Category {
     Water,
     Buildings,
     Roads,
+    Railways,
     Boundaries,
     Labels,
 }
 
 impl Category {
     /// In drawing order, bottom first, as IGN's style draws them.
-    pub const ALL: [Category; 7] = [
+    pub const ALL: [Category; 8] = [
         Category::Vegetation,
         Category::Relief,
         Category::Water,
         Category::Buildings,
         Category::Roads,
+        Category::Railways,
         Category::Boundaries,
         Category::Labels,
     ];
@@ -68,6 +70,7 @@ impl Category {
             Category::Water => "eau",
             Category::Buildings => "bati",
             Category::Roads => "routes",
+            Category::Railways => "ferre",
             Category::Boundaries => "limites",
             Category::Labels => "toponymes",
         }
@@ -79,7 +82,8 @@ impl Category {
             Category::Relief => "Relief",
             Category::Water => "Eau",
             Category::Buildings => "Bâti",
-            Category::Roads => "Routes et voies ferrées",
+            Category::Roads => "Routes",
+            Category::Railways => "Voies ferrées",
             Category::Boundaries => "Limites",
             Category::Labels => "Toponymes",
         }
@@ -96,7 +100,8 @@ impl Category {
             _ if data.starts_with("hydro") || id.contains("hydro") => Category::Water,
             _ if data.starts_with("ocs") => Category::Vegetation,
             _ if data.starts_with("oro") => Category::Relief,
-            _ if data.starts_with("routier") || data.starts_with("ferre") => Category::Roads,
+            _ if data.starts_with("routier") => Category::Roads,
+            _ if data.starts_with("ferre") => Category::Railways,
             _ if data.starts_with("limite") || data.starts_with("parcellaire") => {
                 Category::Boundaries
             }

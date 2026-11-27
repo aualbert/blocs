@@ -23,7 +23,7 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth24Plus;
 /// as displayed (not sRGB-aware), and its own pass has no depth buffer.
 const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 /// Layer images stacked on the surface, mirrored in terrain.wgsl.
-pub const SLOTS: usize = 8;
+pub const SLOTS: usize = 9;
 /// Depths offered for the base, in metres.
 pub const BASE_DEPTHS: std::ops::RangeInclusive<f32> = 10.0..=1000.0;
 /// MSAA samples per pixel: smooths the block's outline and wall edges at little cost.
@@ -51,7 +51,7 @@ struct Uniforms {
     grid: [f32; 4],
     sun: [f32; 4],
     /// Opacity of each layer slot, bottom first; 0 for empty slots.
-    opacity: [[f32; 4]; 2],
+    opacity: [[f32; 4]; 3],
 }
 
 /// GPU objects for the current block, kept in egui's callback resources.
@@ -527,20 +527,12 @@ impl View3d {
                 self.range.1,
             ],
             sun: sun.extend(0.0).to_array(),
-            opacity: [
-                [
-                    self.opacity[0],
-                    self.opacity[1],
-                    self.opacity[2],
-                    self.opacity[3],
-                ],
-                [
-                    self.opacity[4],
-                    self.opacity[5],
-                    self.opacity[6],
-                    self.opacity[7],
-                ],
-            ],
+            // SLOTS opacities, padded to whole vec4s.
+            opacity: {
+                let mut o = [0.0; 12];
+                o[..SLOTS].copy_from_slice(&self.opacity);
+                bytemuck::cast(o)
+            },
         }
     }
 

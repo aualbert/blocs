@@ -102,8 +102,13 @@ struct Family {
 
 impl MapLayer {
     /// Its opacity if shown; a Plan IGN category also needs its family `plan` shown.
+    /// Labels are always opaque: see-through, they only blur.
     fn shown(&self, plan: Family) -> Option<f32> {
         let family = match self.category {
+            Some(Category::Labels) => Family {
+                opacity: 1.0,
+                ..plan
+            },
             Some(_) => plan,
             None => Family {
                 visible: true,
@@ -676,12 +681,15 @@ impl Blocs {
             self.search_results(ui, &search);
             // Greyed out without the map, so that the bar keeps its layout.
             ui.add_enabled_ui(self.view != View::Block, |ui| {
-                ui.toggle_value(&mut self.drawing, "Tracer le cadre")
-                    .on_hover_text(
-                        "Glissez sur la carte pour tracer le cadre (10 km au plus par côté).",
-                    );
+                // A button, grey like the others, highlighted while drawing.
+                let button = egui::Button::new("Tracer le cadre").selected(self.drawing);
+                let tip = "Glissez sur la carte pour tracer le cadre (10 km au plus par côté).";
+                if ui.add(button).on_hover_text(tip).clicked() {
+                    self.drawing = !self.drawing;
+                }
             });
             self.options(ui);
+            egui::containers::menu::MenuButton::new("Aide").ui(ui, help);
         });
     }
 
@@ -890,7 +898,7 @@ impl Blocs {
 
     fn options_menu(&mut self, ui: &mut egui::Ui) {
         // A fixed width, which the département list fills, its scroll bar on the edge.
-        ui.set_width(360.0);
+        ui.set_width(270.0);
         let Some(storage) = &self.storage else {
             ui.spinner();
             return;
@@ -979,65 +987,74 @@ impl Blocs {
                 layer_row(
                     ui,
                     &mut self.vector.visible,
-                    &mut self.vector.opacity,
+                    Some(&mut self.vector.opacity),
                     "Plan IGN",
                 )
             })
             .body(|ui| {
                 ui.add_enabled_ui(self.vector.visible, |ui| {
                     for layer in plan {
-                        layer_row(ui, &mut layer.visible, &mut layer.opacity, layer.name);
+                        // Labels without opacity: see `MapLayer::shown`.
+                        let labels = layer.category == Some(Category::Labels);
+                        let opacity = (!labels).then_some(&mut layer.opacity);
+                        layer_row(ui, &mut layer.visible, opacity, layer.name);
                     }
                 });
             });
         for layer in photo {
-            layer_row(ui, &mut layer.visible, &mut layer.opacity, layer.name);
+            layer_row(ui, &mut layer.visible, Some(&mut layer.opacity), layer.name);
         }
     }
 
     fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        egui::CollapsingHeader::new("Bloc")
-            .default_open(true)
-            .show(ui, |ui| {
-                ui.spacing_mut().slider_width = 110.0;
-                // Without a block, the same controls, greyed out on placeholder values.
-                let block = self.view3d.is_some();
-                let mut none = (1.5, 300.0);
-                let (exaggeration, base_depth) = match &mut self.view3d {
-                    Some(view) => (&mut view.exaggeration, &mut view.base_depth),
-                    None => (&mut none.0, &mut none.1),
-                };
-                ui.add_enabled_ui(block, |ui| {
-                    egui::Grid::new("bloc").show(ui, |ui| {
-                        ui.label("Relief");
-                        ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
-                        ui.end_row();
-                        ui.label("Socle");
-                        ui.add(egui::Slider::new(base_depth, view3d::BASE_DEPTHS)
-                                .logarithmic(true)
-                                .suffix(" m"));
-                        ui.end_row();
+        let block = self.view3d.is_some();
+        // The title, then the export flush right, as wide as the sliders were last frame.
+        let id = ui.scope_id().with("sliders");
+        let room: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+        ui.horizontal(|ui| {
+            ui.set_width(room);
+            ui.strong("Bloc");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // Right to left: the size, then the button before it.
+                egui::ComboBox::from_id_salt("largeur")
+                    .width(0.0) // as wide as its text
+                    .selected_text(format!("{} px", self.export_width))
+                    .show_ui(ui, |ui| {
+                        for w in EXPORT_WIDTHS {
+                            ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
+                        }
                     });
-                });
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("largeur")
-                        .selected_text(format!("{} px", self.export_width))
-                        .show_ui(ui, |ui| {
-                            for w in EXPORT_WIDTHS {
-                                ui.selectable_value(&mut self.export_width, w, format!("{w} px"));
-                            }
-                        });
-                    let export = ui
-                        .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
-                        .on_hover_text("Image PNG, fond transparent");
-                    if export.clicked() {
-                        self.export(frame);
-                    }
-                    ui.weak("?").on_hover_text(
-                        "Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas\nDisque jaune : soleil",
-                    );
-                });
+                let export = ui
+                    .add_enabled(block && !self.exporting, egui::Button::new("Exporter…"))
+                    .on_hover_text("Image PNG, fond transparent");
+                if export.clicked() {
+                    self.export(frame);
+                }
             });
+        });
+        ui.spacing_mut().slider_width = 110.0;
+        // Without a block, the same controls, greyed out on placeholder values.
+        let mut none = (1.5, 300.0);
+        let (exaggeration, base_depth) = match &mut self.view3d {
+            Some(view) => (&mut view.exaggeration, &mut view.base_depth),
+            None => (&mut none.0, &mut none.1),
+        };
+        let sliders = ui.add_enabled_ui(block, |ui| {
+            egui::Grid::new("bloc").show(ui, |ui| {
+                ui.label("Relief");
+                ui.add(egui::Slider::new(exaggeration, 1.0..=2.0).prefix("×"));
+                ui.end_row();
+                ui.label("Socle");
+                ui.add(
+                    egui::Slider::new(base_depth, view3d::BASE_DEPTHS)
+                        .logarithmic(true)
+                        .suffix(" m"),
+                );
+                ui.end_row();
+            });
+        });
+        let width = sliders.response.rect.width();
+        ui.data_mut(|d| d.insert_temp(id, width));
     }
 }
 
@@ -1086,7 +1103,9 @@ impl eframe::App for Blocs {
                     .corner_radius(3.0)
                     .inner_margin(egui::Margin::symmetric(4, 1))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(self.credits()).size(11.0).color(color))
+                        // On one line, however long.
+                        let text = egui::RichText::new(self.credits()).size(11.0).color(color);
+                        ui.add(egui::Label::new(text).extend())
                     });
             });
         egui::Area::new(egui::Id::unique("activité"))
@@ -1250,10 +1269,11 @@ fn card<R>(
         .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, add).inner)
 }
 
-/// A layer's toggle, then its opacity slider at the row's right end.
-fn layer_row(ui: &mut egui::Ui, visible: &mut bool, opacity: &mut f32, name: &str) {
+/// A layer's toggle, then its opacity slider, if any, at the row's right end.
+fn layer_row(ui: &mut egui::Ui, visible: &mut bool, opacity: Option<&mut f32>, name: &str) {
     ui.horizontal(|ui| {
         ui.checkbox(visible, name);
+        let Some(opacity) = opacity else { return };
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let slider = egui::Slider::new(opacity, 0.0..=1.0).show_value(false);
             ui.add_enabled(*visible, slider).on_hover_text("Opacité");
@@ -1264,6 +1284,34 @@ fn layer_row(ui: &mut egui::Ui, visible: &mut bool, opacity: &mut f32, name: &st
 /// One line of the activity stack, on its own small card.
 fn line(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::popup(ui.style()).show(ui, |ui| ui.horizontal(add));
+}
+
+/// The help menu: the mouse gestures, on the map and in 3D.
+fn help(ui: &mut egui::Ui) {
+    let sections = [
+        (
+            "Carte",
+            "Glisser : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas",
+        ),
+        (
+            "Vue 3D",
+            "Glisser : tourner\nClic droit : déplacer\nMolette : zoom\nMaj + molette : gauche-droite\nCtrl + molette : haut-bas",
+        ),
+    ];
+    // A little room after the longest lines.
+    let room = egui::Margin {
+        right: 8,
+        ..egui::Margin::ZERO
+    };
+    egui::Frame::NONE.inner_margin(room).show(ui, |ui| {
+        for (k, (title, text)) in sections.into_iter().enumerate() {
+            if k > 0 {
+                ui.separator();
+            }
+            ui.strong(title);
+            ui.label(text);
+        }
+    });
 }
 
 /// A "Supprimer" button that asks "Confirmer" on the first click; leaving it disarms it.
