@@ -320,6 +320,7 @@ impl View3d {
         };
         ui.painter()
             .add(egui_wgpu::Callback::new_paint_callback(rect, callback));
+        paint_sky(ui.painter(), rect, self.sun.dir(), right, self.sun.season());
         if let Some((_, id)) = &self.screen {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().image(*id, rect, uv, egui::Color32::WHITE);
@@ -1032,6 +1033,46 @@ fn image_view(rs: &egui_wgpu::RenderState, levels: &[RgbaImage]) -> wgpu::Textur
             &data,
         )
         .create_view(&Default::default())
+}
+
+/// The sky behind the block, as the sun makes it: the zenith at the top, the horizon at the
+/// bottom, warm while the sun is low, glowing on its side. Only on screen: the block's
+/// image keeps its transparent background, for the export.
+fn paint_sky(painter: &egui::Painter, rect: egui::Rect, sun: Vec3, right: Vec3, season: f32) {
+    type Rgb = [f32; 3];
+    let mix = |a: Rgb, b: Rgb, t: f32| -> Rgb { [0, 1, 2].map(|k| a[k] + (b[k] - a[k]) * t) };
+    // 0 with the sun on the horizon, 1 from 30° up.
+    let day = (sun.y.asin().to_degrees() / 30.0).clamp(0.0, 1.0);
+    let zenith = mix([0.33, 0.42, 0.62], [0.24, 0.47, 0.86], day);
+    // Paler in winter, deeper in summer.
+    let zenith = match season < 0.0 {
+        true => mix(zenith, [0.62, 0.72, 0.86], -season * 0.3),
+        false => mix(zenith, [0.16, 0.38, 0.80], season * 0.3),
+    };
+    let horizon = mix([0.97, 0.72, 0.48], [0.78, 0.86, 0.95], day);
+    let glow = mix([1.0, 0.60, 0.30], [0.93, 0.95, 0.98], day);
+    let color = |c: Rgb| {
+        let [r, g, b] = c.map(|v| (v * 255.0).round() as u8);
+        egui::Color32::from_rgb(r, g, b)
+    };
+
+    // Three columns, left to right; the bottom glows towards the sun's side of the screen.
+    let side = sun.dot(right);
+    let mut mesh = egui::Mesh::default();
+    for x in [0.0, 0.5, 1.0] {
+        let px = rect.left() + x * rect.width();
+        let glowing = ((2.0 * x - 1.0) * side).max(0.0);
+        mesh.colored_vertex(egui::pos2(px, rect.top()), color(zenith));
+        mesh.colored_vertex(
+            egui::pos2(px, rect.bottom()),
+            color(mix(horizon, glow, glowing)),
+        );
+    }
+    for k in [0, 2] {
+        mesh.add_triangle(k, k + 1, k + 2);
+        mesh.add_triangle(k + 1, k + 3, k + 2);
+    }
+    painter.add(mesh);
 }
 
 #[cfg(test)]

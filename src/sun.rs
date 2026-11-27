@@ -55,6 +55,11 @@ impl Sun {
         self.hour = (-east).atan2(cp * up - sp * north).clamp(-max, max);
     }
 
+    /// The season: -1 at the winter solstice, 1 at the summer one.
+    pub fn season(&self) -> f32 {
+        self.declination / TILT
+    }
+
     /// The day's course, from sunrise to sunset.
     pub fn path(&self) -> Vec<Vec3> {
         let max = self.half_day();

@@ -30,6 +30,8 @@ const SURFACE: u32 = 0u;
 const WALL_TOP: u32 = 1u;
 const WALL_BOTTOM: u32 = 2u;
 const FLOOR: u32 = 3u;
+// Light grey of the buildings, also the base's walls and floor.
+const GREY: vec3<f32> = vec3(0.88);
 
 struct Out {
     @builtin(position) pos: vec4<f32>,
@@ -87,14 +89,13 @@ fn vs_main(@location(0) grid: vec2<u32>, @location(1) kind_side: vec2<u32>) -> O
         case FLOOR: {
             p.y = -u.params.y;
             out.normal = vec3(0.0, -1.0, 0.0);
-            out.color = vec3(0.3, 0.27, 0.24);
+            out.color = GREY;
         }
         default: {
             if kind_side.x == WALL_BOTTOM { p.y = -u.params.y; }
             let sides = array(vec3(-1.0, 0.0, 0.0), vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), vec3(0.0, 0.0, -1.0));
             out.normal = sides[kind_side.y];
-            // Ground darkens with depth.
-            out.color = mix(vec3(0.62, 0.48, 0.34), vec3(0.40, 0.30, 0.22), clamp(-p.y / u.params.y, 0.0, 1.0));
+            out.color = GREY;
         }
     }
     out.pos = u.view_proj * vec4(p, 1.0);
@@ -126,10 +127,10 @@ fn vs_building(
     out.pos = u.view_proj * vec4(p, 1.0);
     out.world = p;
     out.uv = vec2(grid.x, u.grid.y - 1.0 - grid.y) / (u.grid.xy - 1.0);
-    // Roofs face up, walls face out (north being -z); all plain light grey.
+    // Roofs face up, walls face out (north being -z); all plain light grey, like the base.
     let is_roof = all(normal == vec2(0.0));
     out.normal = select(vec3(normal.x, 0.0, -normal.y), vec3(0.0, 1.0, 0.0), is_roof);
-    out.color = vec3(0.88);
+    out.color = GREY;
     out.surface = 0.0;
     out.shaded = 1.0;
     return out;

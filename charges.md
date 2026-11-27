@@ -51,7 +51,7 @@ Le parcours nominal tient en huit étapes ; le téléchargement (étape 4) n'a l
 
 ## Exigences fonctionnelles
 
-Vingt-huit exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
+Vingt-neuf exigences décrivent la v1 hors couches. Les exigences sur les couches sont regroupées dans la section suivante.
 
 | ID | Exigence |
 | --- | --- |
@@ -69,7 +69,7 @@ Vingt-huit exigences décrivent la v1 hors couches. Les exigences sur les couche
 | TEL-3 | Progression, pause et reprise du téléchargement ; décompression et conversion automatiques |
 | STO-1 | Menu Options : relief de chaque département téléchargé, Plan IGN de base (CAR-2) et cache des tuiles, avec leur taille et leur suppression ; taille du cache réglable. Reporté : dossier de stockage au choix |
 | GEN-1 | Bloc 3D à 5 m, pleine résolution, construit depuis les données locales |
-| GEN-2 | Socle fermé (faces latérales et dessous) |
+| GEN-2 | Socle fermé (faces latérales et dessous), du gris clair uni des bâtiments |
 | GEN-3 | Bâtiments en 3D, toujours affichés : chaque bâtiment du Plan IGN est extrudé à sa hauteur réelle (non exagérée), posé sur le relief, en gris clair uni. L'eau en coupe sur les faces latérales a été essayée puis écartée : rendu peu convaincant, et pas de profondeur des lacs disponible |
 | NAV-1 | Projection axonométrique (orthographique) unique, celle des blocs diagrammes dessinés : sans point de fuite, une seule échelle sur tout le bloc ; orientation libre, la vue isométrique en est un cas particulier |
 | NAV-2 | Orientation libre à la souris : rotation, inclinaison, zoom, déplacement. Molette : zoom ; Maj + molette : déplacement gauche-droite ; Ctrl + molette : déplacement haut-bas. Même convention sur la carte et en 3D. Sur la carte, le zoom arrière s'arrête quand le monde remplit la vue, et la carte ne sort jamais de ses bords |
@@ -77,6 +77,7 @@ Vingt-huit exigences décrivent la v1 hors couches. Les exigences sur les couche
 | REG-1 | Carte Bloc : étirement du relief (exagération x1 à x2, défaut x1,5) et profondeur du socle (10 à 1 000 m, curseur logarithmique, défaut 6 % de la largeur du bloc) |
 | REG-2 | Azimut et hauteur du soleil |
 | REG-3 | Ombres portées du relief |
+| REG-4 | Ciel derrière le bloc, réglé par le soleil : du zénith en haut à l'horizon en bas, chaud et lumineux du côté du soleil quand il est bas, bleu profond quand il est haut ; plus pâle en hiver, plus soutenu en été. À l'écran seulement : l'export garde son fond transparent |
 | EXP-1 | Export PNG à fond transparent, en 1 280, 1 920 (défaut), 3 840, 5 760 ou 7 680 px sur le plus grand côté, dans la limite du GPU |
 | EXP-2 | Crédits des sources incrustés sur l'image, avec leur date de consultation comme le demande la Licence Ouverte (ex. « Source : IGN – RGE ALTI® 5 m, Plan IGN – Licence Ouverte 2.0 – consulté le 27/11/2026 ») ; les mêmes crédits s'affichent en bas à droite de la fenêtre, selon les sources montrées |
 | EXP-3 | Export conforme à la vue 3D affichée (projection, orientation, réglages), cadré sur le bloc entier quels que soient le zoom et le déplacement à l'écran |
