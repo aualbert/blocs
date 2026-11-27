@@ -1,5 +1,3 @@
-# Blocs
-
 Blocs est une application qui génère des blocs diagrammes de paysages de France
 métropolitaine à partir des données ouvertes de l'IGN.
 
