@@ -92,8 +92,6 @@ pub struct View3d {
     extent: (f32, f32),
     points: (u32, u32),
     range: (f32, f32),
-    /// Last on-screen aspect ratio, reused by the export.
-    aspect: f32,
     /// Opacity of each layer slot, bottom first.
     opacity: [f32; SLOTS],
     sun: Sun,
@@ -175,7 +173,6 @@ impl View3d {
             extent,
             points: (map.nx as u32, map.ny as u32),
             range: map.range(),
-            aspect: 1.5,
             opacity: [0.0; SLOTS],
             // Afternoon sun from the south-west.
             sun: Sun::new(
@@ -276,7 +273,7 @@ impl View3d {
     pub fn ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        self.aspect = rect.aspect_ratio();
+        let aspect = rect.aspect_ratio();
         let (_, right, up) = self.basis();
 
         // Left drag orbits, right or middle drag pans. The wheel zooms;
@@ -305,7 +302,7 @@ impl View3d {
         let size = [size.x.max(1.0) as u32, size.y.max(1.0) as u32];
         let target = self.screen_target(rs, size);
         let callback = Draw {
-            uniforms: self.uniforms(self.aspect),
+            uniforms: self.uniforms(aspect),
             target,
         };
         ui.painter()
@@ -454,15 +451,48 @@ impl View3d {
         (dir, up.cross(dir), up)
     }
 
+    /// The on-screen window: `zoom` high, around the point looked at.
     fn uniforms(&self, aspect: f32) -> Uniforms {
-        let (dir, _, up) = self.basis();
-        // Look at the middle of the relief; the camera stands outside the whole block.
+        let (h, w) = (self.zoom, self.zoom * aspect);
+        self.uniforms_in([-w, w, -h, h])
+    }
+
+    /// Point looked at (the middle of the relief) and the block's diagonal.
+    fn framing(&self) -> (Vec3, f32) {
         let relief = (self.range.1 - self.range.0) * self.exaggeration;
         let target = self.target + Vec3::Y * relief * 0.3;
         let radius = Vec3::new(self.extent.0, relief + self.base_depth, self.extent.1).length();
+        (target, radius)
+    }
+
+    /// The window `[left, right, bottom, top]` (m) that holds the whole block, with a margin.
+    fn fit_window(&self) -> [f32; 4] {
+        let (_, right, up) = self.basis();
+        let (target, _) = self.framing();
+        let (hx, hz) = (self.extent.0 / 2.0, self.extent.1 / 2.0);
+        let top = (self.range.1 - self.range.0) * self.exaggeration;
+        let mut win = [f32::MAX, f32::MIN, f32::MAX, f32::MIN];
+        // The 8 corners of the block's box, seen along the view.
+        for c in 0..8 {
+            let p = Vec3::new(
+                if c & 1 == 0 { -hx } else { hx },
+                if c & 2 == 0 { -self.base_depth } else { top },
+                if c & 4 == 0 { -hz } else { hz },
+            ) - target;
+            let (x, y) = (p.dot(right), p.dot(up));
+            win = [win[0].min(x), win[1].max(x), win[2].min(y), win[3].max(y)];
+        }
+        // 5% around, also room for buildings above the highest ground.
+        let m = 0.05 * (win[1] - win[0]).max(win[3] - win[2]);
+        [win[0] - m, win[1] + m, win[2] - m, win[3] + m]
+    }
+
+    fn uniforms_in(&self, [l, r, b, t]: [f32; 4]) -> Uniforms {
+        let (dir, _, up) = self.basis();
+        // The camera stands outside the whole block.
+        let (target, radius) = self.framing();
         let view = look_at_mat4(target + dir * radius * 2.0, target, up);
-        let (h, w) = (self.zoom, self.zoom * aspect);
-        let proj = orthographic(-w, w, -h, h, 0.0, radius * 4.0);
+        let proj = orthographic(l, r, b, t, 0.0, radius * 4.0);
         let sun = self.sun.dir();
         Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
@@ -491,18 +521,26 @@ impl View3d {
         }
     }
 
-    /// Renders the current view off-screen at `width` px, on a transparent background.
-    /// Returns `(width, height, rgba)`.
-    pub fn render_image(&self, rs: &egui_wgpu::RenderState, width: u32) -> (u32, u32, Vec<u8>) {
-        let height = (width as f32 / self.aspect).round() as u32;
+    /// Renders the whole block, seen as on screen, off-screen on a transparent background,
+    /// its longer side `size` px (within the GPU's limit). Returns `(width, height, rgba)`.
+    pub fn render_image(&self, rs: &egui_wgpu::RenderState, size: u32) -> (u32, u32, Vec<u8>) {
         let (device, queue) = (&rs.device, &rs.queue);
+        let size = size.min(device.limits().max_texture_dimension_2d) as f32;
+        let window = self.fit_window();
+        let aspect = (window[1] - window[0]) / (window[3] - window[2]);
+        let (width, height) = if aspect >= 1.0 {
+            (size, size / aspect)
+        } else {
+            (size * aspect, size)
+        };
+        let (width, height) = (width.round().max(1.0) as u32, height.round().max(1.0) as u32);
         let target = Target::new(device, [width, height], wgpu::TextureUsages::COPY_SRC);
         let renderer = rs.renderer.read();
         let gpu: &Gpu = renderer.callback_resources.get().expect("bloc chargé");
         queue.write_buffer(
             &gpu.uniforms,
             0,
-            bytemuck::bytes_of(&self.uniforms(self.aspect)),
+            bytemuck::bytes_of(&self.uniforms_in(window)),
         );
         let mut encoder = device.create_command_encoder(&Default::default());
         gpu.render(&mut encoder, &target);

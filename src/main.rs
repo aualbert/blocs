@@ -31,12 +31,12 @@ use view3d::View3d;
 
 /// Map centre at start-up.
 const START: (f64, f64) = (2.35, 46.6);
-/// Export widths offered, in pixels.
 /// Glide after a drag pan, gentler than walkers' own (2× the pointer speed, 0.2 s):
 /// starting speed as a share of the pointer's, and decay time (s).
 const GLIDE_SPEED: f32 = 1.0;
 const GLIDE_TAU: f32 = 0.12;
-const EXPORT_WIDTHS: [u32; 3] = [1280, 1920, 3840];
+/// Export sizes offered: the image's longer side, in pixels.
+const EXPORT_WIDTHS: [u32; 5] = [1280, 1920, 3840, 5760, 7680];
 
 /// Messages from background work to the UI.
 enum Msg {
