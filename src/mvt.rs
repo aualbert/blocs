@@ -44,7 +44,7 @@ fn layer_4096(layer: &[u8]) -> Vec<u8> {
     let (Some(parsed), Some(extent)) = (fields(layer), extent(layer)) else {
         return layer.to_vec();
     };
-    if extent == 0 || EXTENT % extent != 0 {
+    if extent == 0 || !EXTENT.is_multiple_of(extent) {
         return layer.to_vec();
     }
     let k = (EXTENT / extent) as i64;

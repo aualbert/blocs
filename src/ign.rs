@@ -1,5 +1,6 @@
 //! Géoplateforme web services: place search and département lookup.
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -19,6 +20,17 @@ pub fn client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
+/// One client for the short requests (search, lookups, layers on the block), so that they
+/// share its connections rather than opening new ones each time.
+pub fn shared() -> Result<reqwest::blocking::Client> {
+    static SHARED: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    if let Some(http) = SHARED.get() {
+        return Ok(http.clone());
+    }
+    let http = client()?;
+    Ok(SHARED.get_or_init(|| http).clone())
+}
+
 /// A search suggestion and its WGS84 position.
 pub struct Place {
     pub label: String,
@@ -29,7 +41,7 @@ pub struct Place {
 /// Autocompletion on addresses and named places.
 pub fn search(text: &str) -> Result<Vec<Place>> {
     let json: Value = serde_json::from_str(
-        &client()?
+        &shared()?
             .get("https://data.geopf.fr/geocodage/completion")
             .query(&[("text", text), ("maximumResponses", "8")])
             .timeout(SHORT)

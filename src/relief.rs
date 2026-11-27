@@ -24,6 +24,8 @@ const FEED: &str = "https://data.geopf.fr/telechargement/resource/RGEALTI";
 /// Least time between two requests to the download service: past 5 in 5 s, it bans the
 /// IP for 5 minutes.
 const PACE: Duration = Duration::from_millis(1500);
+/// Longest single request for an archive, resumed after it.
+const CHUNK_TIME: Duration = Duration::from_secs(300);
 
 /// Waits until `PACE` after the previous request to the download service.
 fn pace() {
@@ -58,9 +60,11 @@ pub fn installed() -> Vec<String> {
     let Ok(entries) = fs::read_dir(relief_dir()) else {
         return Vec::new();
     };
+    // Not the `.tmp` folder of a conversion under way, or cut short.
     let mut deps: Vec<_> = entries
         .flatten()
         .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.contains('.'))
         .collect();
     deps.sort();
     deps
@@ -80,7 +84,7 @@ pub fn disk_use(dep: &str) -> u64 {
 
 /// Archive volumes `(url, bytes)` of the latest 5 m ASC edition for a département (`"D038"`).
 pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
-    let http = client()?;
+    let http = crate::ign::shared()?;
     pace();
     let feed = http
         .get(format!("{FEED}?zone={dep}"))
@@ -197,8 +201,10 @@ pub fn install(dep: &str, pause: &AtomicBool, mut progress: impl FnMut(Progress)
     }
     drop(file);
 
-    convert(&archive, &department_dir(dep), &mut progress)?;
+    // A broken archive is not kept: resuming then downloads it again.
+    let converted = convert(&archive, &department_dir(dep), &mut progress);
     fs::remove_file(&archive)?;
+    converted?;
     Ok(())
 }
 
@@ -369,33 +375,50 @@ impl Heightmap {
     }
 }
 
-/// Fills NaN holes by repeatedly averaging valid 4-neighbours, growing inwards from the edges.
+/// Fills NaN holes ring by ring inwards from their edges, each point the average of its
+/// valid 4-neighbours. Each point is visited once, however large the hole (the sea, abroad).
 fn fill_holes(h: &mut [f32], nx: usize) {
-    let mut todo: Vec<usize> = (0..h.len()).filter(|&k| h[k].is_nan()).collect();
-    while !todo.is_empty() {
-        let mut filled = Vec::new();
-        todo.retain(|&k| {
-            let (i, j) = (k % nx, k / nx);
-            let neighbours = [
-                (i.wrapping_sub(1), j),
-                (i + 1, j),
-                (i, j.wrapping_sub(1)),
-                (i, j + 1),
-            ];
-            let (sum, n) = neighbours
-                .iter()
-                .filter(|&&(a, b)| a < nx && b < h.len() / nx)
-                .map(|&(a, b)| h[b * nx + a])
-                .filter(|v| !v.is_nan())
-                .fold((0.0, 0), |(s, n), v| (s + v, n + 1));
-            if n > 0 {
-                filled.push((k, sum / n as f32));
-            }
-            n == 0
-        });
-        for (k, v) in filled {
+    let ny = h.len() / nx;
+    let neighbours = |k: usize| {
+        let (i, j) = (k % nx, k / nx);
+        [
+            (i.wrapping_sub(1), j),
+            (i + 1, j),
+            (i, j.wrapping_sub(1)),
+            (i, j + 1),
+        ]
+        .into_iter()
+        .filter(move |&(a, b)| a < nx && b < ny)
+        .map(move |(a, b)| b * nx + a)
+    };
+    // The first ring: holes next to a known point.
+    let mut ring: Vec<usize> = (0..h.len())
+        .filter(|&k| h[k].is_nan() && neighbours(k).any(|n| !h[n].is_nan()))
+        .collect();
+    let mut queued = vec![false; h.len()];
+    ring.iter().for_each(|&k| queued[k] = true);
+    while !ring.is_empty() {
+        // From the points known before this ring only.
+        let values: Vec<f32> = (ring.iter())
+            .map(|&k| {
+                let known = neighbours(k).map(|n| h[n]).filter(|v| !v.is_nan());
+                let (sum, n) = known.fold((0.0, 0), |(s, n), v| (s + v, n + 1));
+                sum / n as f32
+            })
+            .collect();
+        for (&k, v) in ring.iter().zip(values) {
             h[k] = v;
         }
+        let mut next = Vec::new();
+        for &k in &ring {
+            for n in neighbours(k) {
+                if h[n].is_nan() && !queued[n] {
+                    queued[n] = true;
+                    next.push(n);
+                }
+            }
+        }
+        ring = next;
     }
 }
 
@@ -409,11 +432,18 @@ fn fetch(
     mut on_bytes: impl FnMut(u64),
 ) -> Result<()> {
     pace();
+    // Cut after a while, so that a stalled transfer neither hangs nor ignores the pause:
+    // the caller resumes it.
     let mut resp = http
         .get(url)
         .header("Range", format!("bytes={offset}-"))
+        .timeout(CHUNK_TIME)
         .send()?
         .error_for_status()?;
+    // A whole file sent again would be appended to the part already there.
+    if offset > 0 && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err("le serveur ne reprend pas le téléchargement".into());
+    }
     let mut buf = vec![0; 1 << 16];
     loop {
         let n = resp.read(&mut buf)?;
@@ -442,6 +472,18 @@ mod tests {
         let d = dalles([439_350.0, 6_868_050.0, 449_350.0, 6_878_050.0]);
         assert_eq!(d.len(), 9);
         assert_eq!(d[0], [435_000.0, 6_865_005.0, 439_995.0, 6_870_000.0]);
+    }
+
+    #[test]
+    fn holes_fill_inwards_from_their_edges() {
+        let nan = f32::NAN;
+        // 3 × 3, a known west column: each ring takes the average of the ring before.
+        let mut h = [1.0, nan, nan, 3.0, nan, nan, 5.0, nan, nan];
+        fill_holes(&mut h, 3);
+        assert_eq!(h, [1.0, 1.0, 1.0, 3.0, 3.0, 3.0, 5.0, 5.0, 5.0]);
+        let mut h = [2.0, nan, nan, 4.0];
+        fill_holes(&mut h, 4);
+        assert_eq!(h, [2.0, 2.0, 4.0, 4.0]);
     }
 
     #[test]

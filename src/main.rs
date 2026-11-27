@@ -53,8 +53,8 @@ enum Msg {
     Installed(String),
     /// The download stopped: paused or failed.
     Stopped(String),
-    /// A block read from disk, with its description, or why it failed.
-    Built(Frame, relief::Result<(Heightmap, String)>),
+    /// A block read from disk, with its grid for the GPU, or why it failed.
+    Built(Frame, relief::Result<(Heightmap, view3d::Grid)>),
     /// A layer's image over a block's frame, with its mipmaps.
     Draped(Frame, &'static str, relief::Result<Vec<image::RgbaImage>>),
     /// The 3D buildings of a block's frame.
@@ -361,7 +361,15 @@ impl Blocs {
                     self.download.queue.retain(|d| *d != dep);
                     self.download.running = false;
                     self.installed = relief::installed();
-                    self.tried = None;
+                    // Built again only if the new relief is the frame's.
+                    if self
+                        .in_frame
+                        .codes
+                        .as_ref()
+                        .is_some_and(|c| c.contains(&dep))
+                    {
+                        self.tried = None;
+                    }
                     // The options menu, if open, lists it.
                     if self.storage.is_some() {
                         self.measure(|| ());
@@ -376,11 +384,11 @@ impl Blocs {
                     }
                 }
                 Msg::Draped(built, id, result) => {
-                    self.draping.remove(id);
-                    // A layer for an older block is dropped; the current one asks again.
+                    // A layer for an older block is dropped, leaving the current block's job be.
                     if self.built != Some(built) {
                         continue;
                     }
+                    self.draping.remove(id);
                     match result {
                         Ok(levels) => {
                             if let (Some(view), Some(rs)) =
@@ -398,12 +406,11 @@ impl Blocs {
                     }
                 }
                 Msg::Buildings(built, mesh) => {
+                    if self.built != Some(built) {
+                        continue;
+                    }
                     self.draping.remove(BUILDINGS);
-                    if let (true, Some(view), Some(rs)) = (
-                        self.built == Some(built),
-                        &self.view3d,
-                        frame.wgpu_render_state(),
-                    ) {
+                    if let (Some(view), Some(rs)) = (&self.view3d, frame.wgpu_render_state()) {
                         view.set_buildings(rs, &mesh);
                         self.draped.insert(BUILDINGS);
                     }
@@ -411,15 +418,14 @@ impl Blocs {
                 Msg::Built(built, result) => {
                     self.building = false;
                     match result {
-                        // The description is for the headless command only.
-                        Ok((map, _)) => {
+                        Ok((map, grid)) => {
                             let rs = frame.wgpu_render_state().expect("rendu wgpu");
                             if let Some(old) = &mut self.view3d {
                                 old.release(rs);
                             }
                             let (x, y) = built.centre();
                             let latitude = lambert93::to_wgs84(x, y).1;
-                            self.view3d = Some(View3d::new(rs, &map, latitude, built.angle));
+                            self.view3d = Some(View3d::new(rs, &map, &grid, latitude, built.angle));
                             // The new block starts without layer images.
                             self.draped.clear();
                             self.draping.clear();
@@ -444,7 +450,7 @@ impl Blocs {
                 send(Msg::Status(text));
                 send(Msg::Departments(frame, Vec::new()));
             };
-            let http = match ign::client() {
+            let http = match ign::shared() {
                 Ok(http) => http,
                 Err(e) => return fail(format!("Réseau indisponible : {e}")),
             };
@@ -535,7 +541,14 @@ impl Blocs {
         if ready && !self.building && self.tried != Some(frame) {
             self.tried = Some(frame);
             self.building = true;
-            self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
+            // The description is for the headless command only.
+            self.spawn(move |send| {
+                let block = load_block(&frame).map(|(map, _)| {
+                    let grid = view3d::mesh(map.nx, map.ny);
+                    (map, grid)
+                });
+                send(Msg::Built(frame, block))
+            });
         }
     }
 
@@ -975,7 +988,7 @@ impl Blocs {
             ui.weak("Zoomez pour afficher les calques.");
         }
         // A fixed width, so the sliders line up on the right edge.
-        ui.set_width(240.0);
+        ui.set_width(CARD_WIDTH);
         ui.spacing_mut().slider_width = 90.0;
         // The photo comes last.
         let last = self.layers.len() - 1;
@@ -1008,11 +1021,9 @@ impl Blocs {
 
     fn settings_3d(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let block = self.view3d.is_some();
-        // The title, then the export flush right, as wide as the sliders were last frame.
-        let id = ui.scope_id().with("sliders");
-        let room: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(0.0);
+        // As wide as the layer card: the title, then the export flush right.
+        ui.set_width(CARD_WIDTH);
         ui.horizontal(|ui| {
-            ui.set_width(room);
             ui.strong("Bloc");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // Right to left: the size, then the button before it.
@@ -1032,7 +1043,10 @@ impl Blocs {
                 }
             });
         });
-        ui.spacing_mut().slider_width = 110.0;
+        // The sliders stretched to the right edge, by how short of it they were last frame.
+        let id = ui.scope_id().with("sliders");
+        let slider_width: f32 = ui.data(|d| d.get_temp(id)).unwrap_or(110.0);
+        ui.spacing_mut().slider_width = slider_width;
         // Without a block, the same controls, greyed out on placeholder values.
         let mut none = (1.5, 300.0);
         let (exaggeration, base_depth) = match &mut self.view3d {
@@ -1053,8 +1067,11 @@ impl Blocs {
                 ui.end_row();
             });
         });
-        let width = sliders.response.rect.width();
-        ui.data_mut(|d| d.insert_temp(id, width));
+        let short = CARD_WIDTH - sliders.response.rect.width();
+        if short.abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(id, (slider_width + short).max(40.0)));
+            ui.ctx().request_repaint();
+        }
     }
 }
 
@@ -1256,6 +1273,9 @@ const EDGE: f32 = 100.0;
 
 /// Space between the cards and the window's edges.
 const MARGIN: f32 = 8.0;
+
+/// Width inside the layer and block cards, one above the other.
+const CARD_WIDTH: f32 = 220.0;
 
 /// A card floating over the views, its top left corner a margin away from `corner`.
 fn card<R>(

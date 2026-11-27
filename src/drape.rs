@@ -4,6 +4,7 @@
 //! Image layers are resampled from their tiles. The Plan IGN is drawn by walkers, as on the
 //! map, into an off-screen Web Mercator image, which is then resampled the same way.
 
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -39,7 +40,7 @@ const EARTH: f64 = 40_075_016.7;
 /// An image layer over `frame`, rows north to south, premultiplied alpha.
 pub fn drape(store: &Store, frame: &Frame) -> Result<RgbaImage> {
     let zoom = ZOOM.min(store.source.max_zoom());
-    let tiles = fetch(store, &crate::ign::client()?, frame, zoom);
+    let tiles = fetch(store, &crate::ign::shared()?, frame, zoom);
     let decoded: HashMap<_, _> = tiles
         .iter()
         .filter_map(|(&k, b)| Some((k, image::load_from_memory(b).ok()?.to_rgba8())))
@@ -67,6 +68,8 @@ pub struct PlanIgn {
     /// Map zoom (256 px grid) the frame is drawn at.
     zoom: u8,
     tiles: HashMap<(u32, u32), Vec<u8>>,
+    /// Draws every category, made for the first.
+    offscreen: OnceCell<Offscreen>,
 }
 
 impl PlanIgn {
@@ -77,7 +80,7 @@ impl PlanIgn {
             .log2()
             .round();
         let zoom = zoom.clamp(1.0, store.source.max_zoom() as f64 + 1.0) as u8;
-        let tiles = fetch(store, &crate::ign::client()?, frame, zoom - 1);
+        let tiles = fetch(store, &crate::ign::shared()?, frame, zoom - 1);
         if tiles.is_empty() {
             return Err("tuiles du Plan IGN indisponibles".into());
         }
@@ -85,6 +88,7 @@ impl PlanIgn {
             frame: *frame,
             zoom,
             tiles,
+            offscreen: OnceCell::new(),
         })
     }
 
@@ -95,7 +99,7 @@ impl PlanIgn {
         if level >= BUILDINGS_LEVEL {
             return Ok(crate::buildings::mesh(level, &self.tiles, &self.frame));
         }
-        let tiles = fetch(store, &crate::ign::client()?, &self.frame, BUILDINGS_LEVEL);
+        let tiles = fetch(store, &crate::ign::shared()?, &self.frame, BUILDINGS_LEVEL);
         Ok(crate::buildings::mesh(BUILDINGS_LEVEL, &tiles, &self.frame))
     }
 
@@ -139,7 +143,16 @@ impl PlanIgn {
             (origin.1 + h as f64 / 2.0) / scale,
         );
 
-        let image = render_map(Styled(styled), lon, lat, self.zoom, [w, h], ppp as f32, rs)?;
+        let image = render_map(
+            &self.offscreen,
+            Styled(styled),
+            lon,
+            lat,
+            self.zoom,
+            [w, h],
+            ppp as f32,
+            rs,
+        )?;
         let pixel = |px: i64, py: i64| -> [f32; 4] {
             let (x, y) = (px - origin.0 as i64, py - origin.1 as i64);
             image
@@ -169,9 +182,18 @@ impl Tiles for Styled {
     }
 }
 
+/// An egui context without a window and a renderer of its own, walkers' installed in it as
+/// in the app's: made once, its fonts kept, for all the categories of a frame.
+struct Offscreen {
+    ctx: egui::Context,
+    state: egui_wgpu::RenderState,
+}
+
 /// Draws walkers' map of `tiles`, centred on `lon, lat`, into a `size` pixel image: one egui
 /// pass without a window, rendered off-screen with walkers' own renderer.
+#[allow(clippy::too_many_arguments)]
 fn render_map(
+    offscreen: &OnceCell<Offscreen>,
     mut tiles: Styled,
     lon: f64,
     lat: f64,
@@ -180,8 +202,6 @@ fn render_map(
     ppp: f32,
     rs: &egui_wgpu::RenderState,
 ) -> Result<RgbaImage> {
-    let ctx = egui::Context::default();
-    crate::style::install_font(&ctx);
     let points = vec2(size[0] as f32, size[1] as f32) / ppp;
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(pos2(0.0, 0.0), points)),
@@ -193,42 +213,45 @@ fn render_map(
         .or_default()
         .native_pixels_per_point = Some(ppp);
 
-    // Fonts only exist once a pass has run; its font atlas is uploaded with the second's.
-    let mut first = ctx.run_ui(input.clone(), |_| {});
+    let mut first = None;
+    let Offscreen { ctx, state } = offscreen.get_or_init(|| {
+        let ctx = egui::Context::default();
+        crate::style::install_font(&ctx);
+        // Fonts only exist once a pass has run; its font atlas is uploaded with the second's.
+        first = Some(ctx.run_ui(input.clone(), |_| {}));
+        let options = egui_wgpu::RendererOptions {
+            dithering: false,
+            ..Default::default()
+        };
+        // walkers builds its pipeline for `target_format`: the image's, not the window's.
+        let state = egui_wgpu::RenderState {
+            renderer: Arc::new(RwLock::new(egui_wgpu::Renderer::new(
+                &rs.device, FORMAT, options,
+            ))),
+            target_format: FORMAT,
+            ..rs.clone()
+        };
+        walkers::install_renderer(Some(&state));
+        Offscreen { ctx, state }
+    });
     let mut memory = MapMemory::default();
     memory.set_zoom(zoom as f64)?;
     memory.center_at(lon_lat(lon, lat));
-    let mut output = ctx.run_ui(input, |ui| {
+    let output = ctx.run_ui(input, |ui| {
         ui.add(Map::new(Some(&mut tiles), &mut memory, lon_lat(lon, lat)));
     });
     let primitives = ctx.tessellate(output.shapes, ppp);
 
-    // A renderer of our own, walkers' installed in it as in the app's.
-    let options = egui_wgpu::RendererOptions {
-        dithering: false,
-        ..Default::default()
-    };
-    // walkers builds its pipeline for `target_format`: the image's, not the window's.
-    let state = egui_wgpu::RenderState {
-        renderer: Arc::new(RwLock::new(egui_wgpu::Renderer::new(
-            &rs.device, FORMAT, options,
-        ))),
-        target_format: FORMAT,
-        ..rs.clone()
-    };
-    walkers::install_renderer(Some(&state));
     let mut renderer = state.renderer.write();
     let (device, queue) = (&rs.device, &rs.queue);
-    let deltas = first
-        .textures_delta
-        .set
-        .iter()
-        .chain(&output.textures_delta.set);
-    for (id, delta) in deltas.flat_map(|(id, d)| d.iter().map(move |d| (*id, d))) {
-        renderer.update_texture(device, queue, id, delta);
+    let mut deltas: Vec<_> = (first.map(|f| f.textures_delta).into_iter())
+        .chain([output.textures_delta])
+        .collect();
+    for (id, delta) in deltas.iter().flat_map(|d| &d.set) {
+        for delta in delta {
+            renderer.update_texture(device, queue, *id, delta);
+        }
     }
-    first.textures_delta.clear();
-    output.textures_delta.clear();
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("plan ign"),
@@ -267,6 +290,11 @@ fn render_map(
     renderer.render(&mut pass.forget_lifetime(), &primitives, &screen);
     commands.push(encoder.finish());
     queue.submit(commands);
+    // Kept for the next category, but for those egui is done with.
+    for id in deltas.iter().flat_map(|d| &d.free) {
+        renderer.free_texture(id);
+    }
+    deltas.iter_mut().for_each(egui::TexturesDelta::clear);
 
     let rgba = crate::view3d::read_texture(device, queue, &target);
     Ok(RgbaImage::from_raw(size[0], size[1], rgba).expect("taille de l'image"))

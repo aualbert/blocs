@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::f32::consts::{FRAC_PI_2, PI};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use eframe::{egui, egui_wgpu, wgpu};
 use glam::camera::rh::{proj::directx::orthographic, view::look_at_mat4};
@@ -44,7 +45,7 @@ struct Vertex {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniforms {
     view_proj: [[f32; 4]; 4],
     params: [f32; 4],
@@ -76,6 +77,9 @@ struct Gpu {
     /// Buildings pipeline, and their vertices, indices and index count once known.
     building_pipeline: wgpu::RenderPipeline,
     buildings: Option<(wgpu::Buffer, wgpu::Buffer, u32)>,
+    /// The uniforms and on-screen image last drawn, so that an unchanged block is not drawn
+    /// again; `None` once anything else it shows changes.
+    drawn: Option<(Uniforms, u64)>,
 }
 
 /// Axonometric camera orbiting the block, and display settings.
@@ -109,6 +113,8 @@ pub struct View3d {
 
 /// An image the block is drawn into, with its multisampled colour and depth buffers.
 struct Target {
+    /// Unique to each image made, as `Gpu::drawn` remembers it.
+    id: u64,
     texture: wgpu::Texture,
     color: wgpu::TextureView,
     msaa: wgpu::TextureView,
@@ -137,7 +143,9 @@ impl Target {
         let color = texture(COLOR_FORMAT, attachment | usage, 1);
         let msaa = texture(COLOR_FORMAT, attachment, SAMPLES);
         let depth = texture(DEPTH_FORMAT, attachment, SAMPLES);
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         Self {
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
             color: color.create_view(&Default::default()),
             msaa: msaa.create_view(&Default::default()),
             depth: depth.create_view(&Default::default()),
@@ -161,15 +169,16 @@ const AXES: [(&str, [f32; 3], f32, f32); 6] = [
 ];
 
 impl View3d {
-    /// Uploads the block to the GPU, replacing the previous one; `latitude` in degrees,
-    /// `angle` the frame's.
+    /// Uploads the block and its `grid` to the GPU, replacing the previous one; `latitude`
+    /// in degrees, `angle` the frame's.
     pub fn new(
         render_state: &egui_wgpu::RenderState,
         map: &Heightmap,
+        grid: &Grid,
         latitude: f64,
         angle: f64,
     ) -> Self {
-        let gpu = upload(render_state, map);
+        let gpu = upload(render_state, map, grid);
         render_state.renderer.write().callback_resources.insert(gpu);
         let cell = CELL as f32;
         let extent = ((map.nx - 1) as f32 * cell, (map.ny - 1) as f32 * cell);
@@ -207,8 +216,9 @@ impl View3d {
         self.shadows_for = Some(sun);
         let (nx, ny) = (self.points.0 as usize, self.points.1 as usize);
         let mask = shadow::mask(&self.heights, nx, ny, sun);
-        let renderer = rs.renderer.read();
-        if let Some(gpu) = renderer.callback_resources.get::<Gpu>() {
+        let mut renderer = rs.renderer.write();
+        if let Some(gpu) = renderer.callback_resources.get_mut::<Gpu>() {
+            gpu.drawn = None;
             let mx = shadow::size(nx, ny).0;
             rs.queue.write_texture(
                 gpu.shadows.as_image_copy(),
@@ -247,6 +257,7 @@ impl View3d {
                         usage,
                     })
             };
+            gpu.drawn = None;
             gpu.buildings = Some((
                 buffer(
                     bytemuck::cast_slice(&mesh.vertices),
@@ -602,9 +613,14 @@ impl egui_wgpu::CallbackTrait for Draw {
         encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
-        if let Some(gpu) = resources.get::<Gpu>() {
-            queue.write_buffer(&gpu.uniforms, 0, bytemuck::bytes_of(&self.uniforms));
-            gpu.render(encoder, &self.target);
+        if let Some(gpu) = resources.get_mut::<Gpu>() {
+            // Unchanged since drawn into this image: egui shows it as it is.
+            let key = Some((self.uniforms, self.target.id));
+            if gpu.drawn != key {
+                queue.write_buffer(&gpu.uniforms, 0, bytemuck::bytes_of(&self.uniforms));
+                gpu.render(encoder, &self.target);
+                gpu.drawn = key;
+            }
         }
         Vec::new()
     }
@@ -654,6 +670,7 @@ impl Gpu {
             entries: &entries,
         });
         self.slots = ids;
+        self.drawn = None;
     }
 
     /// Draws the block into `target`, on a transparent background, resolving the samples
@@ -694,8 +711,15 @@ impl Gpu {
     }
 }
 
+/// The block's vertices and indices, which `View3d::new` uploads.
+pub struct Grid {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+}
+
 /// Surface grid, then two vertices per edge point for the walls, then the 4 floor corners.
-fn mesh(nx: usize, ny: usize) -> (Vec<Vertex>, Vec<u32>) {
+/// Slow on big blocks: off the UI thread.
+pub fn mesh(nx: usize, ny: usize) -> Grid {
     let v = |i: usize, j: usize, kind: u8, side: u8| Vertex {
         grid: [i as u16, j as u16],
         kind_side: [kind, side, 0, 0],
@@ -745,10 +769,10 @@ fn mesh(nx: usize, ny: usize) -> (Vec<Vertex>, Vec<u32>) {
         v(nx - 1, ny - 1, FLOOR, 0),
     ]);
     quad(start, start + 1, start + 2, start + 3);
-    (vertices, indices)
+    Grid { vertices, indices }
 }
 
-fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
+fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap, grid: &Grid) -> Gpu {
     let device = &rs.device;
 
     let texture = device.create_texture_with_data(
@@ -904,7 +928,7 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         },
     );
 
-    let (vertices, indices) = mesh(map.nx, map.ny);
+    let Grid { vertices, indices } = grid;
     let buffer = |label, contents: &[u8], usage| {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some(label),
@@ -934,17 +958,18 @@ fn upload(rs: &egui_wgpu::RenderState, map: &Heightmap) -> Gpu {
         slots: Vec::new(),
         vertices: buffer(
             "vertices",
-            bytemuck::cast_slice(&vertices),
+            bytemuck::cast_slice(vertices),
             wgpu::BufferUsages::VERTEX,
         ),
         indices: buffer(
             "indices",
-            bytemuck::cast_slice(&indices),
+            bytemuck::cast_slice(indices),
             wgpu::BufferUsages::INDEX,
         ),
         index_count: indices.len() as u32,
         building_pipeline,
         buildings: None,
+        drawn: None,
     };
     gpu.bind(device, Vec::new());
     gpu
