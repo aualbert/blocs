@@ -7,7 +7,9 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::ign::client;
 
@@ -19,6 +21,19 @@ const TILE: usize = 1000; // points per dalle side
 const TILE_ROW0: i64 = 1;
 const NODATA: u16 = u16::MAX;
 const FEED: &str = "https://data.geopf.fr/telechargement/resource/RGEALTI";
+/// Least time between two requests to the download service: past 5 in 5 s, it bans the
+/// IP for 5 minutes.
+const PACE: Duration = Duration::from_millis(1500);
+
+/// Waits until `PACE` after the previous request to the download service.
+fn pace() {
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some(t) = *last {
+        std::thread::sleep(PACE.saturating_sub(t.elapsed()));
+    }
+    *last = Some(Instant::now());
+}
 
 pub enum Progress {
     Download { done: u64, total: u64 },
@@ -66,6 +81,7 @@ pub fn disk_use(dep: &str) -> u64 {
 /// Archive volumes `(url, bytes)` of the latest 5 m ASC edition for a département (`"D038"`).
 pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
     let http = client()?;
+    pace();
     let feed = http
         .get(format!("{FEED}?zone={dep}"))
         .send()?
@@ -77,6 +93,7 @@ pub fn archive_urls(dep: &str) -> Result<Vec<(String, u64)>> {
         .max_by_key(|t| t.rsplit('_').next().unwrap_or_default().to_owned())
         .ok_or(format!("pas de relief 5 m pour {dep}"))?;
 
+    pace();
     let entries = http
         .get(format!("{FEED}/{edition}"))
         .send()?
@@ -321,6 +338,30 @@ impl Heightmap {
         })
     }
 
+    /// `nx × ny` points read bilinearly at `at(i, j)`, in this map's grid units.
+    pub fn resample(&self, nx: usize, ny: usize, at: impl Fn(usize, usize) -> (f64, f64)) -> Self {
+        let h =
+            |i: usize, j: usize| self.heights[j.min(self.ny - 1) * self.nx + i.min(self.nx - 1)];
+        let heights = (0..ny)
+            .flat_map(|j| (0..nx).map(move |i| (i, j)))
+            .map(|(i, j)| {
+                let (x, y) = at(i, j);
+                let x = x.clamp(0.0, (self.nx - 1) as f64);
+                let y = y.clamp(0.0, (self.ny - 1) as f64);
+                let (i0, j0) = (x as usize, y as usize);
+                let (fx, fy) = ((x - i0 as f64) as f32, (y - j0 as f64) as f32);
+                let row = |j| h(i0, j) + (h(i0 + 1, j) - h(i0, j)) * fx;
+                row(j0) + (row(j0 + 1) - row(j0)) * fy
+            })
+            .collect();
+        Self {
+            nx,
+            ny,
+            heights,
+            holes: self.holes,
+        }
+    }
+
     pub fn range(&self) -> (f32, f32) {
         self.heights
             .iter()
@@ -367,6 +408,7 @@ fn fetch(
     pause: &AtomicBool,
     mut on_bytes: impl FnMut(u64),
 ) -> Result<()> {
+    pace();
     let mut resp = http
         .get(url)
         .header("Range", format!("bytes={offset}-"))

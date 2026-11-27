@@ -48,6 +48,9 @@ pub const IGN: Attribution = Attribution {
     logo_dark: None,
 };
 
+/// Why a tile the server does not have fails; walkers then draws its parent instead.
+const ABSENT: &str = "tuile absente du serveur";
+
 /// A tile as a worker hands it back.
 enum Fetched {
     Image(ColorImage),
@@ -136,21 +139,27 @@ impl Store {
     pub fn bytes(&self, http: &reqwest::blocking::Client, id: TileId) -> Result<Vec<u8>> {
         let path = self.path(id);
         if let Ok(bytes) = fs::read(&path) {
+            if bytes.is_empty() {
+                return Err(ABSENT.into());
+            }
             // Mark the tile as recently used, for the cache trimming.
             if let Ok(file) = fs::File::options().append(true).open(&path) {
                 let _ = file.set_modified(SystemTime::now());
             }
             return Ok(bytes);
         }
-        let bytes = http
+        let response = http
             .get(self.source.url(id.zoom, id.x, id.y))
             .timeout(crate::ign::SHORT)
-            .send()?
-            .error_for_status()?
-            .bytes()?
-            .to_vec();
-        // Write then rename, so an interrupted write never leaves a broken tile.
+            .send()?;
         fs::create_dir_all(path.parent().unwrap())?;
+        // None on the server (the poles, say): an empty file, so it is never asked again.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            fs::write(&path, [])?;
+            return Err(ABSENT.into());
+        }
+        let bytes = response.error_for_status()?.bytes()?.to_vec();
+        // Write then rename, so an interrupted write never leaves a broken tile.
         let tmp = path.with_extension(format!("{:?}.tmp", std::thread::current().id()));
         fs::write(&tmp, &bytes)?;
         fs::rename(&tmp, &path)?;
@@ -166,7 +175,8 @@ impl Store {
                 let size = [image.width() as usize, image.height() as usize];
                 Fetched::Image(ColorImage::from_rgba_unmultiplied(size, &image))
             }
-            Source::PlanIgn => Fetched::Data(Bytes::from(bytes)),
+            // Read as walkers can: some coarse tiles come at a lower extent.
+            Source::PlanIgn => Fetched::Data(Bytes::from(crate::mvt::to_4096(&bytes).into_owned())),
         })
     }
 }

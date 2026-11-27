@@ -5,6 +5,7 @@ mod ign;
 mod lambert93;
 mod layers;
 mod map;
+mod mvt;
 mod relief;
 mod shadow;
 mod style;
@@ -24,7 +25,7 @@ use walkers::{Map, MapMemory, lon_lat};
 use ign::Place;
 use layers::Source;
 use map::{Edit, Frame, FrameTool};
-use relief::{Heightmap, Progress};
+use relief::{CELL, Heightmap, Progress};
 use style::Category;
 use tiles::{PlanIgnTiles, Store, TileLayer};
 use view3d::View3d;
@@ -138,7 +139,6 @@ struct Download {
     pause: Arc<AtomicBool>,
     running: bool,
     text: String,
-    fraction: f32,
     /// Tiles being converted after the download: too short to pause.
     converting: bool,
 }
@@ -159,11 +159,11 @@ struct Blocs {
     plan: Store,
     /// Its tiles, for the overview's download progress.
     plan_tiles: PlanIgnTiles,
-    /// Tiles the map waits for, as last drawn.
-    map_loading: usize,
     map_memory: MapMemory,
     /// Map speed after a drag pan, in points per second.
     glide: egui::Vec2,
+    /// The map is being dragged.
+    panning: bool,
     frame: Option<Frame>,
     edit: Option<Edit>,
     drawing: bool,
@@ -210,6 +210,10 @@ impl Blocs {
         // walkers draws vector tiles with its own wgpu pipeline.
         walkers::install_renderer(cc.wgpu_render_state.as_ref());
         style::install_font(&cc.egui_ctx);
+        // All text in the strong colour (white on dark), the default grey being hard to read.
+        cc.egui_ctx.all_styles_mut(|s| {
+            s.visuals.override_text_color = Some(s.visuals.strong_text_color())
+        });
         // The Plan IGN categories, top first, all drawn from one download; the photo below.
         let ctx = cc.egui_ctx.clone();
         let plan = Store::new("planign", Source::PlanIgn);
@@ -253,9 +257,9 @@ impl Blocs {
             background,
             plan,
             plan_tiles,
-            map_loading: 0,
             map_memory,
             glide: egui::Vec2::ZERO,
+            panning: false,
             frame: None,
             edit: None,
             drawing: false,
@@ -270,7 +274,6 @@ impl Blocs {
                 pause: Arc::default(),
                 running: false,
                 text: String::new(),
-                fraction: 0.0,
                 converting: false,
             },
             view3d: None,
@@ -337,19 +340,15 @@ impl Blocs {
                 Msg::Progress(dep, p) => {
                     let name = ign::department_name(&dep);
                     self.download.converting = matches!(p, Progress::Convert { .. });
-                    (self.download.text, self.download.fraction) = match p {
-                        Progress::Download { done, total } => (
-                            format!(
-                                "{name} : téléchargement {} / {} Mo",
-                                done / 1_000_000,
-                                total / 1_000_000
-                            ),
-                            done as f32 / total.max(1) as f32,
+                    self.download.text = match p {
+                        Progress::Download { done, total } => format!(
+                            "{name} : téléchargement {} / {} Mo",
+                            done / 1_000_000,
+                            total / 1_000_000
                         ),
-                        Progress::Convert { done, total } => (
-                            format!("{name} : préparation {done} / {total} dalles"),
-                            done as f32 / total.max(1) as f32,
-                        ),
+                        Progress::Convert { done, total } => {
+                            format!("{name} : préparation {done} / {total} dalles")
+                        }
                     };
                 }
                 Msg::Installed(dep) => {
@@ -413,9 +412,9 @@ impl Blocs {
                             if let Some(old) = &mut self.view3d {
                                 old.release(rs);
                             }
-                            let (x, y) = ((built.x0 + built.x1) / 2.0, (built.y0 + built.y1) / 2.0);
+                            let (x, y) = built.centre();
                             let latitude = lambert93::to_wgs84(x, y).1;
-                            self.view3d = Some(View3d::new(rs, &map, latitude));
+                            self.view3d = Some(View3d::new(rs, &map, latitude, built.angle));
                             // The new block starts without layer images.
                             self.draped.clear();
                             self.draping.clear();
@@ -445,7 +444,7 @@ impl Blocs {
                 Err(e) => return fail(format!("Réseau indisponible : {e}")),
             };
             // Which départements touch each dalle of the frame, asked in parallel.
-            let dalles = relief::dalles([frame.x0, frame.y0, frame.x1, frame.y1]);
+            let dalles = relief::dalles(frame.bounds());
             let answers: Vec<_> = std::thread::scope(|s| {
                 let jobs: Vec<_> = dalles
                     .iter()
@@ -533,6 +532,23 @@ impl Blocs {
             self.building = true;
             self.spawn(move |send| send(Msg::Built(frame, load_block(&frame))));
         }
+    }
+
+    /// The sources on screen: the relief with a block, then the layers drawn.
+    fn credits(&self) -> String {
+        let block = self.view != View::Map && self.view3d.is_some();
+        let overview =
+            self.view != View::Block && self.map_memory.zoom() < layers::STACK_ZOOM as f64;
+        let photo = self.photo_visible();
+        let category =
+            (self.layers.iter()).any(|l| l.category.is_some() && l.shown(self.vector).is_some());
+        // The Plan IGN's background is drawn whenever the photo is hidden.
+        export::credits(
+            block,
+            overview || !photo || category,
+            photo,
+            &export::today(),
+        )
     }
 
     /// Prepares the block image of each visible layer that has none yet. The Plan IGN
@@ -627,8 +643,10 @@ impl Blocs {
             .map(|(id, _)| id)
             .collect();
         let credits = export::credits(
+            true,
             shown.iter().any(|&id| id != "photo"),
             shown.contains(&"photo"),
+            &export::today(),
         );
         self.exporting = true;
         self.spawn(move |send| {
@@ -765,11 +783,7 @@ impl Blocs {
         if paused {
             text += " · en pause";
         }
-        ui.add(
-            egui::ProgressBar::new(self.download.fraction)
-                .text(text)
-                .desired_width(360.0),
-        );
+        ui.label(text);
     }
 
     /// Everything under way, then how the last job ended: one line each, stacked.
@@ -823,18 +837,10 @@ impl Blocs {
         }
         if let Some((done, total)) = self.plan_tiles.seed_progress() {
             line(ui, |ui| {
-                let text = format!("Plan IGN de base : {done} / {total} tuiles");
-                let bar = egui::ProgressBar::new(done as f32 / total as f32).text(text);
-                ui.add(bar.desired_width(360.0));
+                ui.label(format!("Plan IGN de base : {done} / {total} tuiles"));
             });
             // Its tiles arrive without waking the UI.
             ui.ctx().request_repaint_after_secs(1.0);
-        } else {
-            // Counted while drawing the map: none without it.
-            let n = self.map_loading;
-            if n > 0 && self.view != View::Block {
-                busy(ui, &format!("Chargement de la carte : {n} tuiles"));
-            }
         }
         if let Some((text, at)) = self.status.clone() {
             // Fades out over its last second, or goes at once on "x".
@@ -1065,6 +1071,24 @@ impl eframe::App for Blocs {
                 self.settings_3d(ui, frame)
             });
         }
+        // The sources seen, bottom right, as on an export.
+        egui::Area::new(egui::Id::unique("sources"))
+            .pivot(egui::Align2::RIGHT_BOTTOM)
+            .fixed_pos(all.right_bottom() - egui::Vec2::splat(MARGIN))
+            .interactable(false)
+            .show(&ctx, |ui| {
+                // A thin card, coloured like the others.
+                let visuals = ui.visuals();
+                // Text grey as the search box's hint, a little larger than small text.
+                let (fill, color) = (visuals.window_fill, visuals.weak_text_color());
+                egui::Frame::NONE
+                    .fill(fill)
+                    .corner_radius(3.0)
+                    .inner_margin(egui::Margin::symmetric(4, 1))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(self.credits()).size(11.0).color(color))
+                    });
+            });
         egui::Area::new(egui::Id::unique("activité"))
             .pivot(egui::Align2::LEFT_BOTTOM)
             .fixed_pos(all.left_bottom() + egui::vec2(MARGIN, -MARGIN))
@@ -1133,6 +1157,7 @@ impl Blocs {
     }
 
     fn map_view(&mut self, ui: &mut egui::Ui) {
+        let start = lon_lat(START.0, START.1);
         // Shift + wheel pans east-west, Ctrl + wheel north-south; the plain wheel zooms.
         let scroll = ui.input(|i| i.smooth_scroll_delta);
         let modifiers = ui.input(|i| i.modifiers);
@@ -1140,23 +1165,37 @@ impl Blocs {
             && scroll != egui::Vec2::ZERO
             && ui.rect_contains_pointer(ui.available_rect_before_wrap())
         {
-            map::pan(&mut self.map_memory, lon_lat(START.0, START.1), scroll);
+            map::pan(&mut self.map_memory, start, scroll);
             ui.input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+        }
+        // Drag panning is ours rather than walkers', so that the map is kept in the world
+        // before it is drawn: the pointer's move while dragging, then the glide after it.
+        let (delta, dt) = ui.input(|i| (i.pointer.delta(), i.stable_dt));
+        if self.panning {
+            map::pan(&mut self.map_memory, start, delta);
+        } else if self.glide.length() > 10.0 {
+            map::pan(&mut self.map_memory, start, self.glide * dt);
+            self.glide *= (-dt / GLIDE_TAU).exp();
+            ui.ctx().request_repaint();
+        }
+        if map::keep_in_world(&mut self.map_memory, start, ui.available_size()) {
+            self.glide = egui::Vec2::ZERO;
+        }
+        // At the widest, the wheel no longer zooms out: walkers would first show the world
+        // too small, with white borders, until `keep_in_world` zooms back in.
+        let widest = map::widest_zoom(ui.available_size());
+        if self.map_memory.zoom() <= widest + 1e-6 {
+            ui.input_mut(|i| i.smooth_scroll_delta.y = i.smooth_scroll_delta.y.max(0.0));
         }
         // White under the map, where tiles have not arrived yet.
         ui.painter()
             .rect_filled(ui.available_rect_before_wrap(), 0.0, egui::Color32::WHITE);
-        let pan = !self.drawing && self.edit.is_none();
         let overview = self.map_memory.zoom() < layers::STACK_ZOOM as f64;
         let (photo, vector) = (self.photo_visible(), self.vector);
-        let mut map = Map::new(None, &mut self.map_memory, lon_lat(START.0, START.1))
+        let mut map = Map::new(None, &mut self.map_memory, start)
             // walkers defaults to Ctrl + wheel zoom and plain-wheel panning.
             .zoom_with_ctrl(false)
-            .drag_pan_buttons(if pan {
-                egui::DragPanButtons::PRIMARY
-            } else {
-                egui::DragPanButtons::empty()
-            })
+            .drag_pan_buttons(egui::DragPanButtons::empty())
             .with_plugin(FrameTool {
                 frame: &mut self.frame,
                 edit: &mut self.edit,
@@ -1164,12 +1203,7 @@ impl Blocs {
             });
         // Zoomed out, the whole Plan IGN kept on disk; zoomed in, the chosen layers, bottom
         // first. The Plan IGN's white background would hide the photo, so it goes without.
-        // Tiles the drawn layers wait for: queued, read, downloaded or styled. walkers counts
-        // the shared Plan IGN fetches in each category's, so they are counted once apart.
-        let fetch = walkers::TiledSource::stats(&self.plan_tiles).in_progress;
-        let mut loading = 0;
         if overview || !photo {
-            loading += self.background.stats().in_progress.saturating_sub(fetch);
             map = map.with_layer(&mut self.background, 1.0);
         }
         for layer in self.layers.iter_mut().rev() {
@@ -1179,35 +1213,21 @@ impl Blocs {
             };
             let Some(opacity) = opacity else { continue };
             map = match &mut layer.tiles {
-                MapTiles::Images(tiles) => {
-                    loading += walkers::Tiles::stats(tiles).in_progress;
-                    map.with_layer(tiles, opacity)
-                }
-                MapTiles::Styled(styled) => {
-                    loading += styled.stats().in_progress.saturating_sub(fetch);
-                    map.with_layer(styled, opacity)
-                }
+                MapTiles::Images(tiles) => map.with_layer(tiles, opacity),
+                MapTiles::Styled(styled) => map.with_layer(styled, opacity),
             };
         }
         let response = ui.add(map);
-        self.map_loading = loading + fetch;
-
-        // Replace walkers' glide on release, which carries the map too far, with ours.
-        let (velocity, dt) = ui.input(|i| (i.pointer.velocity(), i.stable_dt));
-        if pan && response.dragged_by(egui::PointerButton::Primary) {
-            self.glide = velocity * GLIDE_SPEED;
-        } else if response.drag_stopped() {
-            if let Some(center) = self.map_memory.detached() {
-                self.map_memory.center_at(center);
-            }
-        } else if self.glide.length() > 10.0 {
-            map::pan(
-                &mut self.map_memory,
-                lon_lat(START.0, START.1),
-                self.glide * dt,
-            );
-            self.glide *= (-dt / GLIDE_TAU).exp();
+        // A zoom past the world's edges, kept in it for the next frame.
+        if map::keep_in_world(&mut self.map_memory, start, response.rect.size()) {
             ui.ctx().request_repaint();
+        }
+        // The primary button pans, unless it draws or edits the frame; letting go, it glides.
+        self.panning = !self.drawing
+            && self.edit.is_none()
+            && response.dragged_by(egui::PointerButton::Primary);
+        if self.panning {
+            self.glide = ui.input(|i| i.pointer.velocity()) * GLIDE_SPEED;
         }
     }
 }
@@ -1280,7 +1300,18 @@ fn progress_text(p: &Progress) -> String {
 fn load_block(frame: &Frame) -> relief::Result<(Heightmap, String)> {
     let start = Instant::now();
     let (nx, ny) = frame.points();
-    let map = Heightmap::load(frame.x0, frame.y0, nx, ny)?;
+    let map = if frame.angle == 0.0 {
+        Heightmap::load(frame.x0, frame.y0, nx, ny)?
+    } else {
+        // Turned: the box holding it, resampled along its sides.
+        let [x0, y0, x1, y1] = frame.bounds().map(|v| (v / CELL).floor());
+        let (bx, by) = ((x1 - x0) as usize + 2, (y1 - y0) as usize + 2);
+        let held = Heightmap::load(x0 * CELL, y0 * CELL, bx, by)?;
+        held.resample(nx, ny, |i, j| {
+            let (x, y) = frame.at(i as f64 * CELL, j as f64 * CELL);
+            (x / CELL - x0, y / CELL - y0)
+        })
+    };
     let (lo, hi) = map.range();
     let text = format!(
         "Bloc {nx} × {ny} points lu en {:.2} s · altitudes {lo:.0}–{hi:.0} m · {} points comblés",

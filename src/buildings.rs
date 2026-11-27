@@ -70,11 +70,8 @@ pub fn mesh(level: u8, tiles: &HashMap<(u32, u32), Vec<u8>>, frame: &Frame) -> M
                     (ty as f64 + c.y as f64 / extent) / n,
                 );
                 let (lon, lat) = from_mercator(mx, my);
-                let (x, y) = lambert93::from_wgs84(lon, lat);
-                [
-                    ((x - frame.x0) / CELL) as f32,
-                    ((y - frame.y0) / CELL) as f32,
-                ]
+                let (u, v) = frame.local(lambert93::from_wgs84(lon, lat));
+                [(u / CELL) as f32, (v / CELL) as f32]
             };
             for polygon in &polygons {
                 // A piece wholly in the tile's margin is drawn by the neighbouring tile.

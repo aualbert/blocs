@@ -8,8 +8,8 @@ use std::f32::consts::{FRAC_PI_2, PI};
 use std::sync::Arc;
 
 use eframe::{egui, egui_wgpu, wgpu};
-use glam::Vec3;
 use glam::camera::rh::{proj::directx::orthographic, view::look_at_mat4};
+use glam::{Mat4, Quat, Vec3};
 use image::RgbaImage;
 use wgpu::util::DeviceExt;
 
@@ -97,6 +97,8 @@ pub struct View3d {
     /// Opacity of each layer slot, bottom first.
     opacity: [f32; SLOTS],
     sun: Sun,
+    /// The block's turn on the map, anticlockwise: the sun and the axes stay on the compass.
+    angle: f32,
     /// The block's heights, and the sun its shadows were cast for: on the true relief,
     /// so that stretching it leaves them alone.
     heights: Vec<f32>,
@@ -159,8 +161,14 @@ const AXES: [(&str, [f32; 3], f32, f32); 6] = [
 ];
 
 impl View3d {
-    /// Uploads the block to the GPU, replacing the previous one; `latitude` in degrees.
-    pub fn new(render_state: &egui_wgpu::RenderState, map: &Heightmap, latitude: f64) -> Self {
+    /// Uploads the block to the GPU, replacing the previous one; `latitude` in degrees,
+    /// `angle` the frame's.
+    pub fn new(
+        render_state: &egui_wgpu::RenderState,
+        map: &Heightmap,
+        latitude: f64,
+        angle: f64,
+    ) -> Self {
         let gpu = upload(render_state, map);
         render_state.renderer.write().callback_resources.insert(gpu);
         let cell = CELL as f32;
@@ -183,6 +191,7 @@ impl View3d {
                 (latitude as f32).to_radians(),
                 Vec3::new(-0.5, 0.6, 0.6).normalize(),
             ),
+            angle: angle as f32,
             heights: map.heights.clone(),
             shadows_for: None,
             screen: None,
@@ -191,7 +200,7 @@ impl View3d {
 
     /// Casts the relief's shadows again if the sun moved.
     fn update_shadows(&mut self, rs: &egui_wgpu::RenderState) {
-        let sun = self.sun.dir();
+        let sun = self.to_block(self.sun.dir());
         if self.shadows_for == Some(sun) {
             return;
         }
@@ -463,6 +472,11 @@ impl View3d {
     }
 
     /// Point looked at (the middle of the relief) and the block's diagonal.
+    /// A compass direction in the block's own axes.
+    fn to_block(&self, d: Vec3) -> Vec3 {
+        Quat::from_rotation_y(-self.angle) * d
+    }
+
     fn framing(&self) -> (Vec3, f32) {
         let relief = (self.range.1 - self.range.0) * self.exaggeration;
         let target = self.target + Vec3::Y * relief * 0.3;
@@ -479,11 +493,13 @@ impl View3d {
         let mut win = [f32::MAX, f32::MIN, f32::MAX, f32::MIN];
         // The 8 corners of the block's box, seen along the view.
         for c in 0..8 {
-            let p = Vec3::new(
-                if c & 1 == 0 { -hx } else { hx },
-                if c & 2 == 0 { -self.base_depth } else { top },
-                if c & 4 == 0 { -hz } else { hz },
-            ) - target;
+            let p = Quat::from_rotation_y(self.angle)
+                * Vec3::new(
+                    if c & 1 == 0 { -hx } else { hx },
+                    if c & 2 == 0 { -self.base_depth } else { top },
+                    if c & 4 == 0 { -hz } else { hz },
+                )
+                - target;
             let (x, y) = (p.dot(right), p.dot(up));
             win = [win[0].min(x), win[1].max(x), win[2].min(y), win[3].max(y)];
         }
@@ -496,9 +512,11 @@ impl View3d {
         let (dir, _, up) = self.basis();
         // The camera stands outside the whole block.
         let (target, radius) = self.framing();
-        let view = look_at_mat4(target + dir * radius * 2.0, target, up);
+        // The block turned as on the map, the camera on the compass.
+        let view = look_at_mat4(target + dir * radius * 2.0, target, up)
+            * Mat4::from_rotation_y(self.angle);
         let proj = orthographic(l, r, b, t, 0.0, radius * 4.0);
-        let sun = self.sun.dir();
+        let sun = self.to_block(self.sun.dir());
         Uniforms {
             view_proj: (proj * view).to_cols_array_2d(),
             params: [self.exaggeration, self.base_depth, CELL as f32, 0.0],

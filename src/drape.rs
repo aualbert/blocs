@@ -107,7 +107,8 @@ impl PlanIgn {
             .tiles
             .iter()
             .filter_map(|(&(x, y), bytes)| {
-                let tile = Tile::from_mvt(bytes, style, level, PLAN_TILE).ok()?;
+                let bytes = crate::mvt::to_4096(bytes);
+                let tile = Tile::from_mvt(&bytes, style, level, PLAN_TILE).ok()?;
                 Some((TileId { x, y, zoom: level }, tile))
             })
             .collect();
@@ -324,14 +325,15 @@ fn reproject(
     pixel: impl Fn(i64, i64) -> [f32; 4] + Sync,
 ) -> RgbaImage {
     let (w, h) = frame.size();
+    let top = h;
     let (w, h) = ((w / texel).ceil() as u32, (h / texel).ceil() as u32);
     // Exact Mercator positions every STEP texels; the projection is smooth in between.
     let (gw, gh) = (w / STEP + 2, h / STEP + 2);
     let grid: Vec<(f64, f64)> = (0..gh)
         .flat_map(|j| (0..gw).map(move |i| (i, j)))
         .map(|(i, j)| {
-            let x = frame.x0 + (i * STEP) as f64 * texel;
-            let y = frame.y1 - (j * STEP) as f64 * texel;
+            let (u, v) = ((i * STEP) as f64 * texel, top - (j * STEP) as f64 * texel);
+            let (x, y) = frame.at(u, v);
             let (lon, lat) = lambert93::to_wgs84(x, y);
             let (mx, my) = to_mercator(lon, lat);
             (mx * scale, my * scale)
@@ -385,7 +387,8 @@ fn reproject(
 
 /// Frame centre in degrees.
 fn centre(frame: &Frame) -> (f64, f64) {
-    lambert93::to_wgs84((frame.x0 + frame.x1) / 2.0, (frame.y0 + frame.y1) / 2.0)
+    let (x, y) = frame.centre();
+    lambert93::to_wgs84(x, y)
 }
 
 /// Degrees → Web Mercator world units (0..1, y down).
